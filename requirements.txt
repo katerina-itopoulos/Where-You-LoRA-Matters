@@ -1,26 +1,44 @@
-# Core ML libraries
-transformers==4.55.0
-accelerate>=0.30
-tokenizers>=0.19
-peft>=0.11.0
-safetensors
-
-# PyTorch and vision
+# Core ML frameworks
 torch>=2.0.0
-torchvision
-pillow
+torchvision>=0.15.0
 
-# Quantization
-bitsandbytes
+# Transformers and model libraries
+transformers==4.57.3
+accelerate>=0.30.0
+peft>=0.11.0
+safetensors>=0.4.0
 
-# Data processing
-datasets
+# Qwen VL utilities
+qwen-vl-utils
 
-# Cloud storage (for GCP)
+# Dataset and data processing
+datasets>=2.14.0
+pillow>=9.0.0
+
+# Cloud storage (GCP)
 gcsfs
 google-cloud-storage
 google-auth
 
+# Experiment tracking
+wandb
+
+# Scientific computing
+numpy>=1.24.0
+pandas>=2.0.0
+
 # Utilities
 rich
-qwen_vl_utils
+tqdm
+
+# Jupyter (for notebooks)
+jupyter
+ipykernel
+notebook
+
+# Optional: YAML configs
+pyyaml
+
+# Optional: Plotting for analysis
+matplotlib>=3.7.0
+seaborn>=0.12.0

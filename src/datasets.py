@@ -1,8 +1,13 @@
-from itertools import islice
 from pathlib import Path
-
 from datasets import Dataset, load_dataset
-from transformers.image_processing_utils import process_vision_info
+from datasets import load_dataset, Dataset
+from qwen_vl_utils import process_vision_info
+from itertools import islice
+from datasets import load_dataset, Dataset, concatenate_datasets
+from qwen_vl_utils import process_vision_info
+from itertools import islice
+import gcsfs
+import gc
 
 def cleanup_hf_cache():
     """Clean up HuggingFace cache to free disk space"""
@@ -172,4 +177,211 @@ def prepare_vqav2_datasets(
     print(f"  Val:   {len(val_dataset)} samples (from testdev split)")
     print(f"  Test:  {len(test_dataset)} samples (from testdev split)")
 
+    return train_dataset, val_dataset, test_dataset
+
+
+def prepare_vqav2_datasets_preprocessed_ultra_lean(
+    processor,
+    train_size=1000,
+    val_size=200,
+    test_size=200,
+    gcs_bucket="where_you_lora_matters_thesis",
+    gcs_prefix="datasets/preprocessed_vqa",
+    save_frequency=100  # Save checkpoint every N samples
+):
+    """
+    Ultra RAM-efficient with smart shard-level resume
+    If train is at 3000/5000, resumes from 3000
+    """
+    
+    # GCS paths
+    gcs_train_path = f"gs://{gcs_bucket}/{gcs_prefix}/train_{train_size}"
+    gcs_val_path = f"gs://{gcs_bucket}/{gcs_prefix}/val_{val_size}"
+    gcs_test_path = f"gs://{gcs_bucket}/{gcs_prefix}/test_{test_size}"
+    
+    fs = gcsfs.GCSFileSystem()
+    
+    def check_existing_progress(gcs_path, expected_size):
+        """Check how many samples already exist"""
+        try:
+            if fs.exists(gcs_path.replace("gs://", "")):
+                existing = Dataset.load_from_disk(gcs_path)
+                current_size = len(existing)
+                print(f"    Found {current_size}/{expected_size} samples")
+                return current_size, existing
+            else:
+                print(f"    No existing data")
+                return 0, None
+        except Exception as e:
+            print(f"    Error checking: {e}")
+            return 0, None
+    
+    def format_and_preprocess(example):
+        """Preprocess single example"""
+        if isinstance(example.get('answer'), list):
+            answer = example['answer'][0] if example['answer'] else ""
+        else:
+            answer = example.get('answer', example.get('multiple_choice_answer', ''))
+        
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": example['image']},
+                    {"type": "text", "text": example['question']}
+                ]
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": str(answer)}]
+            }
+        ]
+        
+        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+        image_inputs, video_inputs = process_vision_info(messages)
+        
+        inputs = processor(
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        )
+        
+        result = {
+            "input_ids": inputs['input_ids'][0].tolist(),
+            "attention_mask": inputs['attention_mask'][0].tolist(),
+        }
+        
+        if 'pixel_values' in inputs and inputs['pixel_values'] is not None:
+            pv = inputs['pixel_values']
+            if pv.dim() == 5:
+                pv = pv[0]
+            result['pixel_values'] = pv.tolist()
+        
+        if 'image_grid_thw' in inputs and inputs['image_grid_thw'] is not None:
+            igt = inputs['image_grid_thw']
+            if igt.dim() == 2:
+                igt = igt[0]
+            result['image_grid_thw'] = igt.tolist()
+        
+        return result
+    
+    def process_split_with_resume(stream, total_size, split_name, gcs_path):
+        """
+        Process split with resume capability
+        Resumes from where it left off if partially complete
+        """
+        print(f"\n{'='*70}")
+        print(f"Processing {split_name}: {total_size} samples")
+        print(f"{'='*70}")
+        
+        # Check existing progress
+        current_size, existing_dataset = check_existing_progress(gcs_path, total_size)
+        
+        # If already complete, return it
+        if current_size >= total_size:
+            print(f"  ✓ {split_name} already complete!")
+            return existing_dataset
+        
+        # If partial, skip to where we left off
+        if current_size > 0:
+            print(f"  🔄 Resuming from sample {current_size + 1}")
+            # Skip already processed samples in stream
+            for _ in range(current_size):
+                next(islice(stream, 1))
+        
+        # Process remaining samples
+        remaining = total_size - current_size
+        num_chunks = (remaining + save_frequency - 1) // save_frequency
+        
+        for chunk_idx in range(num_chunks):
+            chunk_start = current_size + (chunk_idx * save_frequency)
+            chunk_end = min(chunk_start + save_frequency, total_size)
+            chunk_size = chunk_end - chunk_start
+            
+            print(f"\n  Chunk {chunk_idx + 1}/{num_chunks}: samples {chunk_start + 1}-{chunk_end}")
+            
+            # Process chunk
+            chunk_examples = []
+            for i in range(chunk_size):
+                try:
+                    example = next(islice(stream, 1))
+                    processed = format_and_preprocess(example)
+                    chunk_examples.append(processed)
+                    
+                    if (i + 1) % 20 == 0:
+                        print(f"    Processed {i + 1}/{chunk_size}...")
+                except StopIteration:
+                    print(f"    ⚠️  Stream ended at {i}")
+                    break
+                except Exception as e:
+                    print(f"    ⚠️  Skipped: {e}")
+                    continue
+            
+            if not chunk_examples:
+                print(f"    ⚠️  No samples in chunk, stopping")
+                break
+            
+            # Create chunk dataset
+            chunk_dataset = Dataset.from_list(chunk_examples)
+            
+            # Append to existing or create new
+            if existing_dataset is not None:
+                combined = concatenate_datasets([existing_dataset, chunk_dataset])
+                combined.save_to_disk(gcs_path)
+                print(f"    ✓ Appended {len(chunk_dataset)} samples (total: {len(combined)})")
+                
+                # Update existing_dataset reference
+                del existing_dataset
+                existing_dataset = combined
+                del combined
+            else:
+                chunk_dataset.save_to_disk(gcs_path)
+                print(f"    ✓ Created with {len(chunk_dataset)} samples")
+                existing_dataset = chunk_dataset
+            
+            # FREE RAM!
+            del chunk_examples, chunk_dataset
+            gc.collect()
+        
+        # Reload final version from GCS
+        final = Dataset.load_from_disk(gcs_path)
+        print(f"  ✓ Final {split_name}: {len(final)} samples")
+        
+        del existing_dataset
+        gc.collect()
+        
+        return final
+    
+    # Check overall progress
+    print("🔍 Checking preprocessing progress...")
+    
+    # Process each split (with resume)
+    print("\n" + "="*70)
+    print("TRAIN SPLIT")
+    train_stream = load_dataset("lmms-lab/VQAv2", split="validation", streaming=True)
+    train_dataset = process_split_with_resume(train_stream, train_size, "train", gcs_train_path)
+    del train_stream
+    gc.collect()
+    
+    print("\n" + "="*70)
+    print("VAL SPLIT")
+    val_stream = load_dataset("lmms-lab/VQAv2", split="testdev", streaming=True)
+    val_dataset = process_split_with_resume(val_stream, val_size, "val", gcs_val_path)
+    del val_stream
+    gc.collect()
+    
+    print("\n" + "="*70)
+    print("TEST SPLIT")
+    test_stream = load_dataset("lmms-lab/VQAv2", split="testdev", streaming=True)
+    test_stream = test_stream.skip(val_size)
+    test_dataset = process_split_with_resume(test_stream, test_size, "test", gcs_test_path)
+    del test_stream
+    gc.collect()
+    
+    print("\n" + "="*70)
+    print("✓ ALL DATASETS COMPLETE")
+    print("="*70)
+    
     return train_dataset, val_dataset, test_dataset
