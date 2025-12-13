@@ -9,6 +9,62 @@ from itertools import islice
 import gcsfs
 import gc
 
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pyarrow.fs as fs
+from datasets import Dataset
+import pyarrow.fs as fs
+
+def load_parquet_shards_from_gcs(bucket, prefix, split, num_samples=None):
+    """
+    Load parquet shards from GCS into a HuggingFace Dataset.
+    
+    Args:
+        bucket: GCS bucket name
+        prefix: Path prefix (e.g., "datasets/preprocessed_vqa_6k")
+        split: "train", "val", or "test"
+        num_samples: Optional - take only first N samples
+    """
+    gcs = fs.GcsFileSystem()
+    shard_path = f"{bucket}/{prefix}/{split}/"
+    
+    # List all parquet files
+    file_info = gcs.get_file_info(fs.FileSelector(shard_path, recursive=False))
+    parquet_files = [f.path for f in file_info if f.path.endswith('.parquet')]
+    parquet_files.sort()  # Ensure consistent ordering
+    
+    print(f"Found {len(parquet_files)} shards for {split}")
+    
+    # Read all shards into one table
+    tables = []
+    total_rows = 0
+    
+    for filepath in parquet_files:
+        table = pq.read_table(f"gs://{filepath}")
+        
+        if num_samples is not None:
+            remaining = num_samples - total_rows
+            if remaining <= 0:
+                break
+            if len(table) > remaining:
+                table = table.slice(0, remaining)
+        
+        tables.append(table)
+        total_rows += len(table)
+        
+        if num_samples is not None and total_rows >= num_samples:
+            break
+    
+    # Concatenate all tables
+    full_table = pa.concat_tables(tables)
+    
+    # Convert to HuggingFace Dataset
+    dataset = Dataset(full_table)
+    
+    print(f"✓ Loaded {len(dataset)} samples for {split}")
+    return dataset
+    
+
 def cleanup_hf_cache():
     """Clean up HuggingFace cache to free disk space"""
     import shutil

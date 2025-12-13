@@ -1,5 +1,4 @@
 import os
-
 import wandb
 from peft import LoraConfig, TaskType
 from transformers import EarlyStoppingCallback, Trainer, TrainingArguments
@@ -72,10 +71,8 @@ def train_vl_lora_with_wandb(
 
     # Training schedule
     epochs=3,
-    max_steps=50,
-    eval_steps=10,
-    logging_steps=5,
-    save_steps=None,  # Default: same as eval_steps
+    max_steps=-1,
+    logging_steps=5,  # Keep for progress logging
 
     # Batch size
     batch_size=1,
@@ -115,10 +112,6 @@ def train_vl_lora_with_wandb(
     Returns:
         trainer: Trained Trainer object
     """
-
-    # Set defaults
-    if save_steps is None:
-        save_steps = eval_steps
 
     if optimizer_config is None:
         optimizer_config = setup_optimizer_scheduler()
@@ -160,7 +153,7 @@ def train_vl_lora_with_wandb(
     wandb.define_metric("epoch")
     wandb.define_metric("*", step_metric="epoch")
 
-    # 2. Create training arguments
+# 2. Create training arguments
     training_args = TrainingArguments(
         output_dir=output_dir,
         run_name=wandb_run_name,
@@ -184,16 +177,14 @@ def train_vl_lora_with_wandb(
         # Precision
         bf16=True,
 
-        # Evaluation & logging
-        eval_strategy="steps",
-        eval_steps=eval_steps,
-        logging_steps=logging_steps,
+        # Evaluation & logging - EPOCH BASED
+        eval_strategy="epoch",  # ← Evaluate after each epoch
+        logging_steps=logging_steps,  # Still log every N steps for progress
         logging_first_step=True,
 
-        # Checkpointing
-        save_strategy="steps",
-        save_steps=save_steps,
-        save_total_limit=2,
+        # Checkpointing - EPOCH BASED
+        save_strategy="epoch",  # ← Save after each epoch
+        save_total_limit=2,  # Keep only best 2 checkpoints
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
@@ -205,8 +196,7 @@ def train_vl_lora_with_wandb(
         report_to="wandb",
 
         # VL-specific
-        remove_unused_columns=False,
-    )
+        remove_unused_columns=False)
 
     # 3. Initialize callbacks
     lora_metrics_callback = WandBLoRAMetricsCallback(compute_freq=logging_steps)

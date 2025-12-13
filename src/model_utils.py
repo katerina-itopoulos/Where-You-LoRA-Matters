@@ -1,14 +1,14 @@
 import torch
 from peft import get_peft_model
-from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+from transformers import AutoProcessor, Qwen3_VLForConditionalGeneration
 
-def setup_vl_model_and_processor(model_name, lora_config, min_pixels=256*28*28, max_pixels=1280*28*28):
+def setup_vl_model_and_processor(model_name, lora_config, min_pixels=256*32*32, max_pixels=1280*32*32):
     """
     Load vision-language model, apply LoRA
     (Processor should be loaded separately before calling this)
 
     Args:
-        model_name: HuggingFace model name (e.g., "Qwen/Qwen2.5-VL-3B-Instruct")
+        model_name: HuggingFace model name
         lora_config: LoraConfig object
         min_pixels: Min image resolution
         max_pixels: Max image resolution
@@ -27,11 +27,12 @@ def setup_vl_model_and_processor(model_name, lora_config, min_pixels=256*28*28, 
         trust_remote_code=True
     )
 
-    # Load vision-language model
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+    # Load vision-language model with Flash Attention 2
+    model = Qwen3_VLForConditionalGeneration.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16,
         device_map="auto",
+        attn_implementation="flash_attention_2",  # ← ADDED THIS!
         trust_remote_code=True
     )
 
@@ -55,6 +56,7 @@ def setup_vl_model_and_processor(model_name, lora_config, min_pixels=256*28*28, 
     trainable_pct = 100 * trainable_params / total_params
 
     print(f"✓ Trainable params: {trainable_params:,} ({trainable_pct:.2f}%)")
+    print(f"✓ Using Flash Attention 2 for faster training")  # ← ADDED THIS!
 
     # Verify gradients are enabled
     has_grad = any(p.requires_grad for p in model.parameters())

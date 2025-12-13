@@ -42,6 +42,7 @@ def build_convs_all_modes(rows):
     convs_image, _,   _   = build_convs_from_rows(rows, mode="image_only")
     return convs_full, convs_text, convs_image, imgs, qs
 
+    
 class VLDataCollator:
     """Custom data collator for vision-language models"""
 
@@ -53,6 +54,11 @@ class VLDataCollator:
         # Extract text fields
         input_ids = [f['input_ids'] for f in features]
         attention_mask = [f['attention_mask'] for f in features]
+        
+        # Extract labels if present (for validation with labels)
+        has_labels = 'labels' in features[0]
+        if has_labels:
+            labels = [f['labels'] for f in features]
 
         # Pad text sequences
         batch = self.processor.tokenizer.pad(
@@ -90,7 +96,24 @@ class VLDataCollator:
             # Stack grid info: (batch_size, 3)
             batch['image_grid_thw'] = torch.stack(image_grid_thw_list, dim=0)
 
-        # Labels for language modeling
-        batch['labels'] = batch['input_ids'].clone().long()
+        # Handle labels
+        if has_labels:
+            # Pad labels with -100 (ignore index)
+            max_length = batch['input_ids'].shape[1]
+            padded_labels = []
+            
+            for label_seq in labels:
+                # Pad to max_length with -100
+                padding_length = max_length - len(label_seq)
+                if padding_length > 0:
+                    padded_label = label_seq + [-100] * padding_length
+                else:
+                    padded_label = label_seq[:max_length]
+                padded_labels.append(padded_label)
+            
+            batch['labels'] = torch.tensor(padded_labels, dtype=torch.long)
+        else:
+            # No labels in dataset, create from input_ids (for training)
+            batch['labels'] = batch['input_ids'].clone().long()
 
         return batch

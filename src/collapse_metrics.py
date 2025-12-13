@@ -94,25 +94,3 @@ def summarize_vectors(V0_all, Vproj_all, T_all):
             "cr1_V0":       concentration_ratio(V0, k=1),
         })
     return metrics
-
-def _norm(x): return str(x).strip().lower()
-def _gold_val(g):
-    if g is None: return None
-    return g[0]["answer"] if isinstance(g, list) and g and isinstance(g[0], dict) and "answer" in g[0] else g
-
-def light_match(pred, gold):
-    g = _gold_val(gold)
-    return int(_norm(g) in _norm(pred)) if g is not None else 0
-
-def delta_metrics(golds, full, text_only, image_only):
-    N = len(golds)
-    acc_full = sum(light_match(p,g) for p,g in zip(full,      golds)) / max(N,1)
-    acc_txt  = sum(light_match(p,g) for p,g in zip(text_only, golds)) / max(N,1)
-    acc_img  = sum(light_match(p,g) for p,g in zip(image_only,golds)) / max(N,1)
-    return {
-        "Acc_full": acc_full,
-        "Acc_textOnly": acc_txt,
-        "Acc_imageOnly": acc_img,
-        "Delta_img": acc_full - acc_txt,
-        "Delta_txt": acc_full - acc_img,
-    }
