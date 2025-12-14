@@ -42,78 +42,35 @@ def build_convs_all_modes(rows):
     convs_image, _,   _   = build_convs_from_rows(rows, mode="image_only")
     return convs_full, convs_text, convs_image, imgs, qs
 
+    import torch
     
-class VLDataCollator:
-    """Custom data collator for vision-language models"""
+from torch.nn.utils.rnn import pad_sequence
 
-    def __init__(self, processor):
-        self.processor = processor
-
+class VLDataCollatorPadTorch:
     def __call__(self, features):
-        """Collate batch of vision-language examples"""
-        # Extract text fields
-        input_ids = [f['input_ids'] for f in features]
-        attention_mask = [f['attention_mask'] for f in features]
-        
-        # Extract labels if present (for validation with labels)
-        has_labels = 'labels' in features[0]
-        if has_labels:
-            labels = [f['labels'] for f in features]
+        input_ids = [torch.as_tensor(f["input_ids"], dtype=torch.long) for f in features]
+        attention_mask = [torch.as_tensor(f["attention_mask"], dtype=torch.long) for f in features]
 
-        # Pad text sequences
-        batch = self.processor.tokenizer.pad(
-            {"input_ids": input_ids, "attention_mask": attention_mask},
-            padding=True,
-            return_tensors="pt"
-        )
+        input_ids = pad_sequence(input_ids, batch_first=True, padding_value=0)
+        attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
 
-        # Ensure correct dtypes for text
-        batch['input_ids'] = batch['input_ids'].long()
-        batch['attention_mask'] = batch['attention_mask'].long()
+        batch = {"input_ids": input_ids, "attention_mask": attention_mask}
 
-        # Handle vision inputs - concatenate all tiles from all images
-        pixel_values_list = []
-        image_grid_thw_list = []
-
-        for f in features:
-            if 'pixel_values' in f and f['pixel_values'] is not None:
-                pv = f['pixel_values']
-                igt = f['image_grid_thw']
-
-                # Ensure they're tensors
-                if not torch.is_tensor(pv):
-                    pv = torch.tensor(pv)
-                if not torch.is_tensor(igt):
-                    igt = torch.tensor(igt)
-
-                pixel_values_list.append(pv)  # Each is (num_tiles, C, H, W)
-                image_grid_thw_list.append(igt)  # Each is (3,)
-
-        # Concatenate vision inputs if present
-        if pixel_values_list:
-            # Concatenate all tiles from all images: (total_tiles, C, H, W)
-            batch['pixel_values'] = torch.cat(pixel_values_list, dim=0)
-            # Stack grid info: (batch_size, 3)
-            batch['image_grid_thw'] = torch.stack(image_grid_thw_list, dim=0)
-
-        # Handle labels
-        if has_labels:
-            # Pad labels with -100 (ignore index)
-            max_length = batch['input_ids'].shape[1]
-            padded_labels = []
-            
-            for label_seq in labels:
-                # Pad to max_length with -100
-                padding_length = max_length - len(label_seq)
-                if padding_length > 0:
-                    padded_label = label_seq + [-100] * padding_length
-                else:
-                    padded_label = label_seq[:max_length]
-                padded_labels.append(padded_label)
-            
-            batch['labels'] = torch.tensor(padded_labels, dtype=torch.long)
+        # labels: pad with -100 if provided, else copy input_ids
+        if "labels" in features[0]:
+            labels = [torch.as_tensor(f["labels"], dtype=torch.long) for f in features]
+            labels = pad_sequence(labels, batch_first=True, padding_value=-100)
+            labels = labels[:, : input_ids.shape[1]]
+            batch["labels"] = labels
         else:
-            # No labels in dataset, create from input_ids (for training)
-            batch['labels'] = batch['input_ids'].clone().long()
+            batch["labels"] = input_ids.clone()
+
+        # vision
+        if "pixel_values" in features[0] and features[0]["pixel_values"] is not None:
+            pv_list = [torch.as_tensor(f["pixel_values"]) for f in features]
+            batch["pixel_values"] = torch.cat(pv_list, dim=0)
+            batch["image_grid_thw"] = torch.stack(
+                [torch.as_tensor(f["image_grid_thw"], dtype=torch.long) for f in features], dim=0
+            )
 
         return batch

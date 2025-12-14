@@ -3,7 +3,7 @@ import wandb
 from peft import LoraConfig, TaskType
 from transformers import EarlyStoppingCallback, Trainer, TrainingArguments
 
-from .data_preprocessing import VLDataCollator
+from .data_preprocessing import VLDataCollatorPadTorch
 from .wandb_utils import WandBLoRAMetricsCallback
 
 
@@ -58,7 +58,6 @@ def train_vl_lora_with_wandb(
     train_dataset,
     val_dataset,
     test_dataset,
-    processor,
 
     # W&B config
     wandb_project="lora-vqav2",
@@ -175,16 +174,17 @@ def train_vl_lora_with_wandb(
         optim="adamw_torch",
 
         # Precision
-        bf16=True,
+        fp16=True,
+        bf16=False,
 
         # Evaluation & logging - EPOCH BASED
-        eval_strategy="epoch",  # ← Evaluate after each epoch
-        logging_steps=logging_steps,  # Still log every N steps for progress
+        eval_strategy="epoch",
+        logging_steps=logging_steps,
         logging_first_step=True,
 
         # Checkpointing - EPOCH BASED
-        save_strategy="epoch",  # ← Save after each epoch
-        save_total_limit=2,  # Keep only best 2 checkpoints
+        save_strategy="epoch",
+        save_total_limit=2,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
@@ -192,11 +192,17 @@ def train_vl_lora_with_wandb(
         # Memory optimization
         gradient_checkpointing=True,
 
+        # DATA LOADING OPTIMIZATION - ADD THESE! ⭐
+        dataloader_num_workers=4,        # Use 8 CPU cores for parallel loading
+        dataloader_pin_memory=True,      # Faster CPU->GPU transfer
+        dataloader_prefetch_factor=4,    # Prefetch 4 batches ahead
+
         # W&B
         report_to="wandb",
 
         # VL-specific
-        remove_unused_columns=False)
+        remove_unused_columns=False,
+    )
 
     # 3. Initialize callbacks
     lora_metrics_callback = WandBLoRAMetricsCallback(compute_freq=logging_steps)
@@ -206,7 +212,7 @@ def train_vl_lora_with_wandb(
     )
 
     # 4. Create data collator
-    data_collator = VLDataCollator(processor)
+    data_collator = VLDataCollatorPadTorch()
 
     # 5. Create trainer
     trainer = Trainer(

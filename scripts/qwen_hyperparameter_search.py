@@ -46,8 +46,8 @@ SAVE_STRATEGY = "epoch"
 LOGGING_STEPS = 100
 
 # Batch configuration
-BATCH_SIZE = 4
-GRAD_ACCUM_STEPS = 1  # Effective batch size = 4
+BATCH_SIZE = 1
+GRAD_ACCUM_STEPS = 4
 
 # Early stopping
 EARLY_STOPPING_PATIENCE = 3  # liStop if no improvement for 3 epochs
@@ -113,6 +113,14 @@ if __name__ == "__main__":
     print(f"✓ Train: {len(train_dataset)} samples")
     print(f"✓ Val: {len(val_dataset)} samples")
     print(f"✓ Test: {len(test_dataset)} samples")
+
+    cols = ["input_ids", "attention_mask", "labels", "pixel_values", "image_grid_thw"]
+    cols = [c for c in cols if c in train_dataset.column_names]
+
+    train_dataset.set_format(type="torch", columns=cols)
+    val_dataset.set_format(type="torch", columns=cols)
+    test_dataset.set_format(type="torch", columns=cols)
+
     
     results = []
 
@@ -143,6 +151,8 @@ if __name__ == "__main__":
                 min_pixels=MIN_PIXELS,
                 max_pixels=MAX_PIXELS
             )
+            model.config.use_cache = False
+            model.gradient_checkpointing_enable()
 
             print(f"✓ Trainable params: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
 
@@ -186,7 +196,6 @@ if __name__ == "__main__":
                 train_dataset=train_dataset,
                 val_dataset=val_dataset,
                 test_dataset=test_dataset,
-                processor=processor,
 
                 # W&B
                 wandb_project=WANDB_PROJECT,
@@ -258,7 +267,8 @@ if __name__ == "__main__":
             if 'trainer' in locals():
                 del trainer
             torch.cuda.empty_cache()
-
+            import gc
+            gc.collect()
             continue
 
     print("\n" + "="*70)

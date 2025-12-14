@@ -1,6 +1,6 @@
 import torch
 from peft import get_peft_model
-from transformers import AutoProcessor, Qwen3_VLForConditionalGeneration
+from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
 def setup_vl_model_and_processor(model_name, lora_config, min_pixels=256*32*32, max_pixels=1280*32*32):
     """
@@ -28,11 +28,11 @@ def setup_vl_model_and_processor(model_name, lora_config, min_pixels=256*32*32, 
     )
 
     # Load vision-language model with Flash Attention 2
-    model = Qwen3_VLForConditionalGeneration.from_pretrained(
+    model = Qwen3VLForConditionalGeneration.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16,
         device_map="auto",
-        attn_implementation="flash_attention_2",  # ← ADDED THIS!
+        attn_implementation="sdpa",
         trust_remote_code=True
     )
 
@@ -56,7 +56,6 @@ def setup_vl_model_and_processor(model_name, lora_config, min_pixels=256*32*32, 
     trainable_pct = 100 * trainable_params / total_params
 
     print(f"✓ Trainable params: {trainable_params:,} ({trainable_pct:.2f}%)")
-    print(f"✓ Using Flash Attention 2 for faster training")  # ← ADDED THIS!
 
     # Verify gradients are enabled
     has_grad = any(p.requires_grad for p in model.parameters())
