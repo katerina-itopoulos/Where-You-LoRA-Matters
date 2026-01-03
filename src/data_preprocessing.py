@@ -41,8 +41,6 @@ def build_convs_all_modes(rows):
     convs_text,  _,   _   = build_convs_from_rows(rows, mode="text_only")
     convs_image, _,   _   = build_convs_from_rows(rows, mode="image_only")
     return convs_full, convs_text, convs_image, imgs, qs
-
-    import torch
     
 from torch.nn.utils.rnn import pad_sequence
 

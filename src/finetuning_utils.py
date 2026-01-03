@@ -5,17 +5,12 @@ from transformers import EarlyStoppingCallback, Trainer, TrainingArguments
 
 from .data_preprocessing import VLDataCollatorPadTorch
 from .wandb_utils import WandBLoRAMetricsCallback
+from .validation_utils import VQAAccuracyCallback
 
 
 def create_lora_config_vl(lora_r, lora_alpha, lora_dropout, target_modules):
     """
-    Create LoRA configuration for Qwen2.5-VL
-
-    Target modules for Qwen2.5-VL language model part:
-    - q_proj, k_proj, v_proj, o_proj (attention)
-    - gate_proj, up_proj, down_proj (FFN)
-
-    Note: We typically don't apply LoRA to the vision encoder
+    Create LoRA configuration for Qwen3-VL
     """
     return LoraConfig(
         r=lora_r,
@@ -27,23 +22,15 @@ def create_lora_config_vl(lora_r, lora_alpha, lora_dropout, target_modules):
         task_type=TaskType.CAUSAL_LM,
     )
 
+
 def setup_optimizer_scheduler(
     learning_rate=5e-5,
     lr_scheduler_type="cosine",
-    warmup_steps=5,
+    warmup_steps=500,
     weight_decay=0.01,
 ):
     """
     Configure optimizer and learning rate scheduler
-
-    Args:
-        learning_rate: Peak learning rate
-        lr_scheduler_type: Type of LR scheduler (cosine, linear, constant, etc.)
-        warmup_steps: Number of warmup steps
-        weight_decay: Weight decay coefficient
-
-    Returns:
-        dict: Configuration for optimizer and scheduler
     """
     return {
         "learning_rate": learning_rate,
@@ -52,18 +39,22 @@ def setup_optimizer_scheduler(
         "weight_decay": weight_decay,
     }
 
+
 def train_vl_lora_with_wandb(
     # Required inputs
     model,
+    processor,
     train_dataset,
     val_dataset,
+    val_accuracy_dataset,
     test_dataset,
-
+    max_grad_norm,
+    
     # W&B config
     wandb_project="lora-vqav2",
     wandb_run_name=None,
     wandb_entity=None,
-    wandb_config=None,  # Additional config to log to W&B
+    wandb_config=None,
 
     # Output
     output_dir="./lora-vqav2-output",
@@ -71,45 +62,31 @@ def train_vl_lora_with_wandb(
     # Training schedule
     epochs=3,
     max_steps=-1,
-    logging_steps=5,  # Keep for progress logging
+    logging_steps=5,
+    
+    # Evaluation strategy
+    eval_strategy="epoch",
+    eval_steps=None,
+    save_strategy=None,
+    save_steps=None,
 
     # Batch size
     batch_size=1,
     gradient_accumulation_steps=4,
 
-    # Optimization (pass dict from setup_optimizer_scheduler)
+    # Optimization
     optimizer_config=None,
 
     # Early stopping
     early_stopping_patience=3,
     early_stopping_threshold=0.01,
+    
+    # VQA accuracy evaluation
+    compute_vqa_accuracy=True,
+    vqa_eval_samples=500,
 ):
     """
-    Main training function - pure orchestration of training loop
-
-    Args:
-        model: PEFT model with LoRA already applied
-        train_dataset: Prepared training dataset
-        val_dataset: Prepared validation dataset
-        test_dataset: Prepared test dataset
-        processor: Processor for collation
-        wandb_project: W&B project name
-        wandb_run_name: W&B run name
-        wandb_entity: W&B entity (username/team)
-        wandb_config: Additional config dict to log to W&B
-        output_dir: Where to save checkpoints
-        max_steps: Maximum training steps
-        eval_steps: Evaluate every N steps
-        logging_steps: Log every N steps
-        save_steps: Save checkpoint every N steps (default: same as eval_steps)
-        batch_size: Per-device batch size
-        gradient_accumulation_steps: Gradient accumulation steps
-        optimizer_config: Dict from setup_optimizer_scheduler()
-        early_stopping_patience: Patience for early stopping
-        early_stopping_threshold: Threshold for early stopping
-
-    Returns:
-        trainer: Trained Trainer object
+    Main training function with optional VQA accuracy evaluation.
     """
 
     if optimizer_config is None:
@@ -117,24 +94,38 @@ def train_vl_lora_with_wandb(
 
     if wandb_config is None:
         wandb_config = {}
+    
+    if save_strategy is None:
+        save_strategy = eval_strategy
+    
+    if save_steps is None:
+        save_steps = eval_steps
+    
+    if eval_strategy == "steps" and eval_steps is None:
+        raise ValueError("eval_steps must be provided when eval_strategy='steps'")
 
     # 1. Initialize W&B
     print(f"\n{'='*70}")
     print("🚀 Initializing Weights & Biases")
     print(f"{'='*70}")
 
-    # Build W&B config
     full_config = {
         "train_size": len(train_dataset),
         "val_size": len(val_dataset),
-        "test_size": len(test_dataset),
+        "val_accuracy_size": len(val_accuracy_dataset) if val_accuracy_dataset else 0,
+        "test_size": len(test_dataset) if test_dataset else 0,
         "trainable_params": sum(p.numel() for p in model.parameters() if p.requires_grad),
         "total_params": sum(p.numel() for p in model.parameters()),
         "max_steps": max_steps,
+        "epochs": epochs,
         "batch_size": batch_size,
         "gradient_accumulation_steps": gradient_accumulation_steps,
+        "eval_strategy": eval_strategy,
+        "eval_steps": eval_steps,
+        "compute_vqa_accuracy": compute_vqa_accuracy,
+        "vqa_eval_samples": vqa_eval_samples,
         **optimizer_config,
-        **wandb_config,  # User-provided config
+        **wandb_config,
     }
     full_config["trainable_percent"] = 100 * full_config["trainable_params"] / full_config["total_params"]
 
@@ -148,11 +139,10 @@ def train_vl_lora_with_wandb(
     print(f"✓ W&B Run: {wandb.run.name}")
     print(f"✓ URL: {wandb.run.url}")
 
-    # Define epoch as the x-axis for all metrics
     wandb.define_metric("epoch")
     wandb.define_metric("*", step_metric="epoch")
 
-# 2. Create training arguments
+    # 2. Create training arguments
     training_args = TrainingArguments(
         output_dir=output_dir,
         run_name=wandb_run_name,
@@ -172,30 +162,34 @@ def train_vl_lora_with_wandb(
         warmup_steps=optimizer_config["warmup_steps"],
         weight_decay=optimizer_config.get("weight_decay", 0.01),
         optim="adamw_torch",
+        max_grad_norm=max_grad_norm,
 
         # Precision
-        fp16=True,
-        bf16=False,
+        fp16=False,
+        bf16=True,
 
-        # Evaluation & logging - EPOCH BASED
-        eval_strategy="epoch",
+        # Evaluation & logging
+        eval_strategy=eval_strategy,
+        eval_steps=eval_steps if eval_strategy == "steps" else None,
         logging_steps=logging_steps,
         logging_first_step=True,
+        eval_on_start=True,
 
-        # Checkpointing - EPOCH BASED
-        save_strategy="epoch",
+        # Checkpointing
+        save_strategy=save_strategy,
+        save_steps=save_steps if save_strategy == "steps" else None,
         save_total_limit=2,
-        load_best_model_at_end=True,
+        load_best_model_at_end=False,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
 
         # Memory optimization
         gradient_checkpointing=True,
 
-        # DATA LOADING OPTIMIZATION - ADD THESE! ⭐
-        dataloader_num_workers=4,        # Use 8 CPU cores for parallel loading
-        dataloader_pin_memory=True,      # Faster CPU->GPU transfer
-        dataloader_prefetch_factor=4,    # Prefetch 4 batches ahead
+        # Data loading optimization
+        dataloader_num_workers=8,
+        dataloader_pin_memory=True,
+        dataloader_prefetch_factor=2,
 
         # W&B
         report_to="wandb",
@@ -203,13 +197,50 @@ def train_vl_lora_with_wandb(
         # VL-specific
         remove_unused_columns=False,
     )
+    
+    # Print training schedule info
+    print(f"\n{'='*70}")
+    print("📊 Training Schedule")
+    print(f"{'='*70}")
+    steps_per_epoch = len(train_dataset) // (batch_size * gradient_accumulation_steps)
+    print(f"Steps per epoch: {steps_per_epoch}")
+    print(f"Total epochs: {epochs}")
+    print(f"Total steps: {steps_per_epoch * epochs}")
+    print(f"Eval strategy: {eval_strategy}")
+    print(f"VQA Accuracy: {'Enabled' if compute_vqa_accuracy else 'Disabled'}")
+
+    if eval_strategy == "steps":
+        print(f"Eval every: {eval_steps} steps")
+        print(f"Total evaluations: ~{(steps_per_epoch * epochs) // eval_steps}")
+    else:
+        print(f"Eval every: 1 epoch ({steps_per_epoch} steps)")
+        print(f"Total evaluations: {epochs}")
+    print(f"{'='*70}\n")
 
     # 3. Initialize callbacks
+    callbacks = []
+    
+    # LoRA metrics
     lora_metrics_callback = WandBLoRAMetricsCallback(compute_freq=logging_steps)
-    early_stopping = EarlyStoppingCallback(
-        early_stopping_patience=early_stopping_patience,
-        early_stopping_threshold=early_stopping_threshold
-    )
+    callbacks.append(lora_metrics_callback)
+    
+    # VQA accuracy callback
+    if compute_vqa_accuracy:
+        vqa_callback = VQAAccuracyCallback(
+            processor=processor,
+            eval_dataset=val_accuracy_dataset,  # ← Use accuracy dataset!
+            max_new_tokens=16,
+            eval_samples=vqa_eval_samples,
+        )
+        callbacks.append(vqa_callback)
+    
+    # Early stopping
+    if early_stopping_patience is not None and early_stopping_patience > 0:
+        early_stopping = EarlyStoppingCallback(
+            early_stopping_patience=early_stopping_patience,
+            early_stopping_threshold=early_stopping_threshold
+        )
+        callbacks.append(early_stopping)
 
     # 4. Create data collator
     data_collator = VLDataCollatorPadTorch()
@@ -221,24 +252,34 @@ def train_vl_lora_with_wandb(
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         data_collator=data_collator,
-        callbacks=[lora_metrics_callback, early_stopping],
+        callbacks=callbacks,
     )
+    
     print("Starting training...")
-
     trainer.train()
+    
     print("\nSaving model...")
     trainer.save_model(output_dir)
     test_dataset.save_to_disk(os.path.join(output_dir, "test_dataset"))
 
+    # Update W&B summary
     wandb.run.summary["final_train_loss"] = trainer.state.log_history[-1].get("loss", None)
     wandb.run.summary["best_val_loss"] = lora_metrics_callback.best_val_loss
+    
+    # Add VQA accuracy to summary
+    if compute_vqa_accuracy:
+        wandb.run.summary["best_vqa_accuracy"] = vqa_callback.best_vqa_accuracy
+        wandb.run.summary["best_exact_match_accuracy"] = vqa_callback.best_exact_match
 
+    # Update artifact metadata
     artifact = wandb.Artifact(
         name=f"lora-checkpoint-{wandb.run.name}",
         type="model",
         description=f"LoRA adapter checkpoint",
         metadata={
             "best_val_loss": lora_metrics_callback.best_val_loss,
+            "best_vqa_accuracy": vqa_callback.best_vqa_accuracy if compute_vqa_accuracy else None,
+            "best_exact_match_accuracy": vqa_callback.best_exact_match if compute_vqa_accuracy else None,
             "train_size": len(train_dataset),
             "val_size": len(val_dataset),
         }
@@ -249,11 +290,17 @@ def train_vl_lora_with_wandb(
 
     print(f"✓ Artifact uploaded: {artifact.name}")
 
-    # 10. Print summary
     print(f"\n{'='*70}")
     print("Training Complete!")
     print(f"Local model: {output_dir}")
     print(f"W&B Artifact: {artifact.name}")
     print(f"Dashboard: {wandb.run.url}")
+    
+    # Print final accuracy
+    if compute_vqa_accuracy:
+        print(f"Best VQA Accuracy: {vqa_callback.best_vqa_accuracy:.2%}")
+        print(f"Best Exact Match: {vqa_callback.best_exact_match:.2%}")
+    
     wandb.finish()
+    
     return trainer
