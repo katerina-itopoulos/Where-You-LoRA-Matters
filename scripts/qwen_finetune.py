@@ -5,13 +5,14 @@ import wandb
 import torch
 import numpy as np
 import random
-sys.path.insert(0, '/home/sagemaker-user/Where-You-LoRA-Matters')
-os.environ['HF_DATASETS_CACHE'] = '/mnt/sagemaker-nvme/hf_cache'
+sys.path.insert(0, '/home/ubuntu/Where-You-LoRA-Matters')
+os.environ['HF_DATASETS_CACHE'] = '/opt/dlami/nvme/hf_cache'
 wandb.login()
-
+import regex as re
 from transformers import AutoProcessor, set_seed
 from src.finetuning_utils import (
     create_lora_config_vl,
+    create_lora_config_vl_with_rank_pattern,
     setup_optimizer_scheduler,
     train_vl_lora_with_wandb,
 )
@@ -20,6 +21,9 @@ from src.validation_utils import generate_validation_configs, create_validation_
 from datasets import Dataset, load_dataset
 
 #torch.autograd.set_detect_anomaly(True)
+
+PLACEMENT_STRATEGY = "proj_only"
+EXPERIMENT_TYPE = "qwen3vl_vqa_projection_lora_finetune_test"
 
 #Constants
 GCS_BUCKET = "where_you_lora_matters_thesis"
@@ -34,34 +38,69 @@ WEIGHT_DECAY = 0.01
 WARM_UP_STEPS = 500
 
 # Hyperparameter search space
-LORA_RANKS = [32]
-LEARNING_RATES = [5e-5]
+LORA_RANKS = [64]
+LEARNING_RATES = [1e-4]
 
 # Fixed LoRA settings
 LORA_ALPHA_MULTIPLIER = 2
 LORA_DROPOUT = 0.05
-TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
-#TARGET_MODULES_LLM = ["q_proj", "k_proj", "v_proj", "o_proj"]
-#TARGET_MODULES_VISION = [r"visual\.blocks\.\d+\.attn\.qkv", r"visual\.blocks\.\d+\.attn\.proj"]
-#TARGET_MODULES_PROJECTOR = [
-#   r"visual\.merger\.linear_fc[12]",
-#    r"visual\.deepstack_merger_list\.\d+\.linear_fc[12]",
-#]
+
+#TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
+TARGET_MODULES_LLM = ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+# Vision encoder layers (27 blocks)
+TARGET_MODULES_VISION = [
+    "visual.blocks.0.attn.qkv", "visual.blocks.0.attn.proj",
+    "visual.blocks.1.attn.qkv", "visual.blocks.1.attn.proj",
+    "visual.blocks.2.attn.qkv", "visual.blocks.2.attn.proj",
+    "visual.blocks.3.attn.qkv", "visual.blocks.3.attn.proj",
+    "visual.blocks.4.attn.qkv", "visual.blocks.4.attn.proj",
+    "visual.blocks.5.attn.qkv", "visual.blocks.5.attn.proj",
+    "visual.blocks.6.attn.qkv", "visual.blocks.6.attn.proj",
+    "visual.blocks.7.attn.qkv", "visual.blocks.7.attn.proj",
+    "visual.blocks.8.attn.qkv", "visual.blocks.8.attn.proj",
+    "visual.blocks.9.attn.qkv", "visual.blocks.9.attn.proj",
+    "visual.blocks.10.attn.qkv", "visual.blocks.10.attn.proj",
+    "visual.blocks.11.attn.qkv", "visual.blocks.11.attn.proj",
+    "visual.blocks.12.attn.qkv", "visual.blocks.12.attn.proj",
+    "visual.blocks.13.attn.qkv", "visual.blocks.13.attn.proj",
+    "visual.blocks.14.attn.qkv", "visual.blocks.14.attn.proj",
+    "visual.blocks.15.attn.qkv", "visual.blocks.15.attn.proj",
+    "visual.blocks.16.attn.qkv", "visual.blocks.16.attn.proj",
+    "visual.blocks.17.attn.qkv", "visual.blocks.17.attn.proj",
+    "visual.blocks.18.attn.qkv", "visual.blocks.18.attn.proj",
+    "visual.blocks.19.attn.qkv", "visual.blocks.19.attn.proj",
+    "visual.blocks.20.attn.qkv", "visual.blocks.20.attn.proj",
+    "visual.blocks.21.attn.qkv", "visual.blocks.21.attn.proj",
+    "visual.blocks.22.attn.qkv", "visual.blocks.22.attn.proj",
+    "visual.blocks.23.attn.qkv", "visual.blocks.23.attn.proj",
+    "visual.blocks.24.attn.qkv", "visual.blocks.24.attn.proj",
+    "visual.blocks.25.attn.qkv", "visual.blocks.25.attn.proj",
+    "visual.blocks.26.attn.qkv", "visual.blocks.26.attn.proj",
+]
+
+# Projector layers (merger + deepstack mergers)
+TARGET_MODULES_PROJECTOR = [
+    "visual.merger.linear_fc1", "visual.merger.linear_fc2",
+    "visual.deepstack_merger_list.0.linear_fc1", "visual.deepstack_merger_list.0.linear_fc2",
+    "visual.deepstack_merger_list.1.linear_fc1", "visual.deepstack_merger_list.1.linear_fc2",
+    "visual.deepstack_merger_list.2.linear_fc1", "visual.deepstack_merger_list.2.linear_fc2",
+]
 
 TARGET_VISION_PROJECTOR = TARGET_MODULES_VISION + TARGET_MODULES_PROJECTOR
 TARGET_LLM_PROJECTOR = TARGET_MODULES_LLM + TARGET_MODULES_PROJECTOR
 
-TRAIN_SIZE = 20000
-VAL_LOSS_SIZE = 2000
-VAL_ACCURACY_SIZE = 2000
-TEST_SIZE = 5000
+TRAIN_SIZE = 10000
+VAL_LOSS_SIZE = 500
+VAL_ACCURACY_SIZE = 500
+TEST_SIZE = 500
 
 # Training configuration
 EPOCHS = 2
 MAX_STEPS = -1
 
 EVAL_STRATEGY = "steps"
-EVAL_STEPS = 250
+EVAL_STEPS = 500
 
 SAVE_STRATEGY = "steps"  
 SAVE_STEPS = 500 
@@ -78,10 +117,10 @@ EARLY_STOPPING_THRESHOLD = None
 
 # VQA Accuracy Evaluation
 COMPUTE_VQA_ACCURACY = True
-VQA_EVAL_SAMPLES = 2000
+VQA_EVAL_SAMPLES = 500
 
 # Weights & Biases
-WANDB_PROJECT = "qwen3vl-experiments-vqa"
+WANDB_PROJECT = "qwen3vl-experiments-vqa-projllm-test"
 WANDB_ENTITY = None
 
 def set_random_seed(seed):
@@ -127,7 +166,7 @@ if __name__ == "__main__":
     print(f"HYPERPARAMETER VALIDATION: {total_runs} configurations")
     print("="*70)
     print(f"Random Seed: {RANDOM_SEED}")
-    print(f"Strategy: LLM-only LoRA (attention layers)")
+    print(f"Strategy: PROJ ONLY")
     print(f"Ranks: {LORA_RANKS}")
     print(f"Learning rates: {LEARNING_RATES}")
     print(f"Training samples: {TRAIN_SIZE}")
@@ -213,14 +252,14 @@ if __name__ == "__main__":
         print(f"LoRA rank: {rank}")
         print(f"LoRA alpha: {alpha} ({LORA_ALPHA_MULTIPLIER}x)")
         print(f"Learning rate: {lr}")
-        print(f"Target modules: {TARGET_MODULES}")
+        print(f"Target modules: {TARGET_LLM_PROJECTOR}")
 
         try:
             lora_config = create_lora_config_vl(
                 lora_r=rank,
                 lora_alpha=alpha,
                 lora_dropout=LORA_DROPOUT,
-                target_modules=TARGET_MODULES
+                target_modules=TARGET_LLM_PROJECTOR
             )
 
             model, _, trainable_params, total_params = setup_vl_model_and_processor(
@@ -242,16 +281,16 @@ if __name__ == "__main__":
             )
 
             wandb_config = {
-                "experiment_type": "hyperparameter_validation",
-                "placement_strategy": "llm_only",
+                "experiment_type": EXPERIMENT_TYPE,
+                "placement_strategy": PLACEMENT_STRATEGY,
                 "model_name": MODEL_NAME,
                 "random_seed": RANDOM_SEED,
                 "lora_r": rank,
                 "lora_alpha": alpha,
                 "lora_alpha_multiplier": LORA_ALPHA_MULTIPLIER,
                 "lora_dropout": LORA_DROPOUT,
-                "target_modules": TARGET_MODULES,
-                "num_target_modules": len(TARGET_MODULES),
+                "target_modules": TARGET_LLM_PROJECTOR,
+                "num_target_modules": len(TARGET_LLM_PROJECTOR),
                 "learning_rate": lr,
                 "lr_scheduler_type": "cosine",
                 "min_pixels": MIN_PIXELS,
@@ -270,13 +309,13 @@ if __name__ == "__main__":
 
             print(f"\nStarting training: {run_name}")
 
-            trainer = train_vl_lora_with_wandb(
+            trainer, run_results = train_vl_lora_with_wandb(
                 # Required
                 model=model,
                 processor=processor,
                 train_dataset=train_dataset,
-                val_dataset=val_loss_dataset,  # ← Use val_loss for computing loss!
-                val_accuracy_dataset=val_accuracy_dataset,  # ← Pass accuracy dataset separately!
+                val_dataset=val_loss_dataset,
+                val_accuracy_dataset=val_accuracy_dataset,
                 test_dataset=test_dataset,
                 max_grad_norm=MAX_GRAD_NORM,
 
@@ -313,11 +352,6 @@ if __name__ == "__main__":
                 vqa_eval_samples=VQA_EVAL_SAMPLES,
             )
 
-            # Get best validation loss
-            best_val_loss = min([log.get("eval_loss", float('inf'))
-                                for log in trainer.state.log_history
-                                if "eval_loss" in log])
-
             # Log success
             result_dict = {
                 "run_id": run_id,
@@ -325,22 +359,23 @@ if __name__ == "__main__":
                 "status": "success",
                 "lora_r": rank,
                 "learning_rate": lr,
-                "best_val_loss": best_val_loss,
+                "best_val_loss": run_results["best_val_loss"],
                 "trainable_params": trainable_params,
             }
             
             # Add VQA accuracy if it was computed
             if COMPUTE_VQA_ACCURACY:
-                result_dict["best_vqa_accuracy"] = wandb.run.summary.get("best_vqa_accuracy", None)
-                result_dict["best_exact_match_accuracy"] = wandb.run.summary.get("best_exact_match_accuracy", None)
+                result_dict["best_vqa_accuracy"] = run_results["best_vqa_accuracy"]
+                result_dict["best_exact_match_accuracy"] = run_results["best_exact_match"]
             
             results.append(result_dict)
 
             print(f"✓ Run {run_id} completed successfully")
-            print(f"✓ Best val loss: {best_val_loss:.4f}")
+            print(f"✓ Best val loss: {run_results['best_val_loss']:.4f}")
+
             if COMPUTE_VQA_ACCURACY:
-                print(f"✓ Best VQA accuracy: {result_dict.get('best_vqa_accuracy', 0):.2%}")
-                print(f"✓ Best exact match: {result_dict.get('best_exact_match_accuracy', 0):.2%}")
+                print(f"✓ Best VQA accuracy: {run_results['best_vqa_accuracy']:.2%}")
+                print(f"✓ Best exact match: {run_results['best_exact_match']:.2%}")
 
             # Clean up
             del model

@@ -1,7 +1,8 @@
 import os
 import wandb
-from peft import LoraConfig, TaskType
+from peft import LoraConfig, TaskType, get_peft_model
 from transformers import EarlyStoppingCallback, Trainer, TrainingArguments
+import torch
 
 from .data_preprocessing import VLDataCollatorPadTorch
 from .wandb_utils import WandBLoRAMetricsCallback
@@ -22,6 +23,37 @@ def create_lora_config_vl(lora_r, lora_alpha, lora_dropout, target_modules):
         task_type=TaskType.CAUSAL_LM,
     )
 
+def create_lora_config_vl_with_rank_pattern(
+    lora_dropout,
+    target_modules,
+    rank_pattern=None,  # Dict mapping regex patterns to ranks
+    alpha_pattern=None,
+):
+    """
+    Create LoRA configuration with different ranks per module pattern
+    
+    Example:
+        rank_pattern = {
+            "visual.merger": 64,
+            "visual.blocks": 32,
+            "model.model": 32,
+        }
+    """
+    # Default rank for modules not matching any pattern
+    default_rank = 64
+    default_alpha = 128
+    
+    return LoraConfig(
+        r=default_rank,
+        lora_alpha=default_alpha,
+        lora_dropout=lora_dropout,
+        target_modules=target_modules,
+        rank_pattern=rank_pattern or {},
+        alpha_pattern=alpha_pattern or {},
+        bias="none",
+        inference_mode=False,
+        task_type=TaskType.CAUSAL_LM,
+    )
 
 def setup_optimizer_scheduler(
     learning_rate=5e-5,
@@ -39,6 +71,35 @@ def setup_optimizer_scheduler(
         "weight_decay": weight_decay,
     }
 
+
+def create_optimizer_with_param_groups(
+    model,
+    llm_lr=5e-5,
+    projector_lr=1e-4,
+    weight_decay=0.01,
+):
+    """
+    Create optimizer with different learning rates for LLM vs projector LoRA adapters
+    """
+    llm_params = []
+    projector_params = []
+    
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        # Check if parameter belongs to visual/projector modules
+        if "visual" in name or "projector" in name:
+            projector_params.append(param)
+        else:
+            llm_params.append(param)
+    
+    print(f"LLM params: {len(llm_params)}, Projector params: {len(projector_params)}")
+    
+    optimizer = torch.optim.AdamW([
+        {"params": llm_params, "lr": llm_lr, "weight_decay": weight_decay},
+        {"params": projector_params, "lr": projector_lr, "weight_decay": weight_decay},
+    ])
+    return optimizer
 
 def train_vl_lora_with_wandb(
     # Required inputs
@@ -76,6 +137,9 @@ def train_vl_lora_with_wandb(
 
     # Optimization
     optimizer_config=None,
+    use_separate_lrs=False,
+    llm_lr=5e-5,
+    projector_lr=1e-4,
 
     # Early stopping
     early_stopping_patience=3,
@@ -86,7 +150,7 @@ def train_vl_lora_with_wandb(
     vqa_eval_samples=500,
 ):
     """
-    Main training function with optional VQA accuracy evaluation.
+    Main training function with optional VQA accuracy evaluation and separate LRs.
     """
 
     if optimizer_config is None:
@@ -124,9 +188,15 @@ def train_vl_lora_with_wandb(
         "eval_steps": eval_steps,
         "compute_vqa_accuracy": compute_vqa_accuracy,
         "vqa_eval_samples": vqa_eval_samples,
+        "use_separate_lrs": use_separate_lrs,
         **optimizer_config,
         **wandb_config,
     }
+    
+    if use_separate_lrs:
+        full_config["llm_lr"] = llm_lr
+        full_config["projector_lr"] = projector_lr
+    
     full_config["trainable_percent"] = 100 * full_config["trainable_params"] / full_config["total_params"]
 
     wandb.init(
@@ -142,7 +212,18 @@ def train_vl_lora_with_wandb(
     wandb.define_metric("epoch")
     wandb.define_metric("*", step_metric="epoch")
 
-    # 2. Create training arguments
+    # 2. Create custom optimizer if using separate LRs
+    optimizer = None
+    if use_separate_lrs:
+        optimizer = create_optimizer_with_param_groups(
+            model=model,
+            llm_lr=llm_lr,
+            projector_lr=projector_lr,
+            weight_decay=optimizer_config.get("weight_decay", 0.01)
+        )
+        print(f"✓ Using separate LRs: LLM={llm_lr}, Projector={projector_lr}")
+
+    # 3. Create training arguments
     training_args = TrainingArguments(
         output_dir=output_dir,
         run_name=wandb_run_name,
@@ -156,8 +237,8 @@ def train_vl_lora_with_wandb(
         per_device_eval_batch_size=batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
 
-        # Optimization
-        learning_rate=optimizer_config["learning_rate"],
+        # Optimization - only set learning_rate if NOT using separate LRs
+        learning_rate=optimizer_config["learning_rate"] if not use_separate_lrs else None,
         lr_scheduler_type=optimizer_config["lr_scheduler_type"],
         warmup_steps=optimizer_config["warmup_steps"],
         weight_decay=optimizer_config.get("weight_decay", 0.01),
@@ -217,7 +298,7 @@ def train_vl_lora_with_wandb(
         print(f"Total evaluations: {epochs}")
     print(f"{'='*70}\n")
 
-    # 3. Initialize callbacks
+    # 4. Initialize callbacks
     callbacks = []
     
     # LoRA metrics
@@ -228,7 +309,7 @@ def train_vl_lora_with_wandb(
     if compute_vqa_accuracy:
         vqa_callback = VQAAccuracyCallback(
             processor=processor,
-            eval_dataset=val_accuracy_dataset,  # ← Use accuracy dataset!
+            eval_dataset=val_accuracy_dataset,
             max_new_tokens=16,
             eval_samples=vqa_eval_samples,
         )
@@ -242,10 +323,10 @@ def train_vl_lora_with_wandb(
         )
         callbacks.append(early_stopping)
 
-    # 4. Create data collator
+    # 5. Create data collator
     data_collator = VLDataCollatorPadTorch()
 
-    # 5. Create trainer
+    # 6. Create trainer
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -253,6 +334,7 @@ def train_vl_lora_with_wandb(
         eval_dataset=val_dataset,
         data_collator=data_collator,
         callbacks=callbacks,
+        optimizers=(optimizer, None) if optimizer else (None, None),
     )
     
     print("Starting training...")
@@ -273,7 +355,7 @@ def train_vl_lora_with_wandb(
 
     # Update artifact metadata
     artifact = wandb.Artifact(
-        name=f"lora-checkpoint-{wandb.run.name}",
+        name=f"lora-checkpoint-{wandb.run.id}",
         type="model",
         description=f"LoRA adapter checkpoint",
         metadata={
@@ -286,7 +368,8 @@ def train_vl_lora_with_wandb(
     )
 
     artifact.add_dir(output_dir)
-    wandb.log_artifact(artifact)
+    logged_artifact = wandb.log_artifact(artifact)
+    logged_artifact.wait()
 
     print(f"✓ Artifact uploaded: {artifact.name}")
 
@@ -300,7 +383,13 @@ def train_vl_lora_with_wandb(
     if compute_vqa_accuracy:
         print(f"Best VQA Accuracy: {vqa_callback.best_vqa_accuracy:.2%}")
         print(f"Best Exact Match: {vqa_callback.best_exact_match:.2%}")
-    
+
+    results = {
+        "best_val_loss": lora_metrics_callback.best_val_loss,
+        "best_vqa_accuracy": vqa_callback.best_vqa_accuracy if compute_vqa_accuracy else None,
+        "best_exact_match": vqa_callback.best_exact_match if compute_vqa_accuracy else None,
+    }
+
     wandb.finish()
     
-    return trainer
+    return trainer, results
