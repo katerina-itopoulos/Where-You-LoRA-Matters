@@ -18,8 +18,8 @@ from src.finetuning_utils import (
 from src.model_utils import setup_vl_model_and_processor
 from datasets import Dataset, load_dataset
 
-PLACEMENT_STRATEGY = "llm_proj"
-EXPERIMENT_TYPE = "qwen3vl_vqa_llm_proj_lora_finetune_trial"
+PLACEMENT_STRATEGY = "vision_proj"
+EXPERIMENT_TYPE = "qwen3vl_vqa_vision_proj_lora_finetune_trial"
 
 #Constants
 GCS_BUCKET = "where_you_lora_matters_thesis"
@@ -33,9 +33,9 @@ MAX_PIXELS = 196*32*32
 WEIGHT_DECAY = 0.01
 WARM_UP_STEPS = 500
 
-LLM_RANK = 32
+VISION_RANK = 128
 PROJECTOR_RANK = 64
-LLM_LR = 5e-5
+VISION_LR = 1e-4
 PROJECTOR_LR = 1e-4
 
 LORA_DROPOUT = 0.05
@@ -114,7 +114,7 @@ COMPUTE_VQA_ACCURACY = True
 VQA_EVAL_SAMPLES = 500
 
 # Weights & Biases
-WANDB_PROJECT = "qwen3vl-experiments-vqa-llm-proj-trial"
+WANDB_PROJECT = "qwen3vl-experiments-vqa-projvision-test"
 WANDB_ENTITY = None
 
 def set_random_seed(seed):
@@ -149,11 +149,11 @@ if __name__ == "__main__":
     set_random_seed(RANDOM_SEED)
 
     print("="*70)
-    print(f"LLM + PROJECTOR TRIAL RUN")
+    print(f"VISION + PROJECTOR TRIAL RUN")
     print("="*70)
     print(f"Random Seed: {RANDOM_SEED}")
-    print(f"Strategy: LLM + PROJECTOR (separate ranks & LRs)")
-    print(f"LLM: rank {LLM_RANK}, lr {LLM_LR}")
+    print(f"Strategy: VISION + PROJECTOR (separate ranks & LRs)")
+    print(f"Vision: rank {VISION_RANK}, lr {VISION_LR}")
     print(f"Projector: rank {PROJECTOR_RANK}, lr {PROJECTOR_LR}")
     print(f"Training samples: {TRAIN_SIZE}")
     print(f"Epochs: {EPOCHS}")
@@ -226,20 +226,22 @@ if __name__ == "__main__":
     test_dataset.set_format(type="torch", columns=test_cols)
 
     print("\n" + "="*70)
-    print("SETTING UP MODEL WITH SEPARATE RANKS FOR LLM AND PROJECTOR")
+    print("SETTING UP MODEL WITH SEPARATE RANKS FOR VISION AND PROJECTOR")
     print("="*70)
 
     # Create LoRA config with rank_pattern for different ranks per component
     lora_config = create_lora_config_vl_with_rank_pattern(
         lora_dropout=LORA_DROPOUT,
-        target_modules=TARGET_LLM_PROJECTOR,
+        target_modules=TARGET_VISION_PROJECTOR,
         rank_pattern={
-            "model.model": LLM_RANK,      # LLM layers get rank 32
-            "visual": PROJECTOR_RANK,      # Projector layers get rank 64
+            "visual.blocks": VISION_RANK,       # Vision encoder blocks get rank 32
+            "visual.merger": PROJECTOR_RANK,    # Projector layers get rank 64
+            "visual.deepstack": PROJECTOR_RANK, # Deepstack mergers get rank 64
         },
         alpha_pattern={
-            "model.model": LLM_RANK * 2,   # Alpha = 2 * rank
-            "visual": PROJECTOR_RANK * 2,
+            "visual.blocks": VISION_RANK * 2,      # Alpha = 2 * rank
+            "visual.merger": PROJECTOR_RANK * 2,
+            "visual.deepstack": PROJECTOR_RANK * 2,
         }
     )
 
@@ -256,26 +258,26 @@ if __name__ == "__main__":
 
     # Verify rank assignment
     print("\n=== Verifying LoRA Rank Assignment ===")
-    llm_lora_count = 0
+    vision_lora_count = 0
     proj_lora_count = 0
     for name, module in model.named_modules():
         if hasattr(module, 'r'):  # It's a LoRA module
-            if 'model.model' in name:
-                llm_lora_count += 1
-                if llm_lora_count <= 3:  # Print first 3 for verification
-                    print(f"LLM: {name}: rank={module.r}")
-            elif 'visual' in name:
+            if 'visual.blocks' in name:
+                vision_lora_count += 1
+                if vision_lora_count <= 3:  # Print first 3 for verification
+                    print(f"Vision: {name}: rank={module.r}")
+            elif 'visual.merger' in name or 'visual.deepstack' in name:
                 proj_lora_count += 1
                 if proj_lora_count <= 3:  # Print first 3 for verification
                     print(f"Projector: {name}: rank={module.r}")
     
-    print(f"Total LLM LoRA modules: {llm_lora_count}")
+    print(f"Total Vision LoRA modules: {vision_lora_count}")
     print(f"Total Projector LoRA modules: {proj_lora_count}")
     print("="*70)
 
     # Setup optimizer config (needed for scheduler settings)
     optimizer_config = setup_optimizer_scheduler(
-        learning_rate=LLM_LR,  # Default, will be overridden by separate LRs
+        learning_rate=VISION_LR,  # Default, will be overridden by separate LRs
         lr_scheduler_type="cosine",
         warmup_steps=WARM_UP_STEPS,
         weight_decay=WEIGHT_DECAY,
@@ -286,14 +288,14 @@ if __name__ == "__main__":
         "placement_strategy": PLACEMENT_STRATEGY,
         "model_name": MODEL_NAME,
         "random_seed": RANDOM_SEED,
-        "llm_rank": LLM_RANK,
+        "vision_rank": VISION_RANK,
         "projector_rank": PROJECTOR_RANK,
-        "llm_lr": LLM_LR,
+        "vision_lr": VISION_LR,
         "projector_lr": PROJECTOR_LR,
         "lora_dropout": LORA_DROPOUT,
-        "target_modules_llm": TARGET_MODULES_LLM,
+        "target_modules_vision": TARGET_MODULES_VISION,
         "target_modules_projector": TARGET_MODULES_PROJECTOR,
-        "num_target_modules": len(TARGET_LLM_PROJECTOR),
+        "num_target_modules": len(TARGET_VISION_PROJECTOR),
         "lr_scheduler_type": "cosine",
         "min_pixels": MIN_PIXELS,
         "max_pixels": MAX_PIXELS,
@@ -306,7 +308,7 @@ if __name__ == "__main__":
         "trainable_percentage": 100*trainable_params/total_params,
     }
 
-    run_name = f"llm_proj_trial_r{LLM_RANK}_{PROJECTOR_RANK}_lr{LLM_LR}_{PROJECTOR_LR}"
+    run_name = f"vision_proj_trial_r{VISION_RANK}_{PROJECTOR_RANK}_lr{VISION_LR}_{PROJECTOR_LR}"
     output_dir = f"./validation_outputs/{run_name}"
 
     print(f"\nStarting training: {run_name}")
@@ -347,7 +349,7 @@ if __name__ == "__main__":
             # Optimizer with separate LRs
             optimizer_config=optimizer_config,
             use_separate_lrs=True,
-            llm_lr=LLM_LR,
+            vision_lr=VISION_LR,
             projector_lr=PROJECTOR_LR,
 
             # Early stopping

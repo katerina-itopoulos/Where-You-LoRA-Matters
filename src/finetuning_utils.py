@@ -71,35 +71,50 @@ def setup_optimizer_scheduler(
         "weight_decay": weight_decay,
     }
 
-
 def create_optimizer_with_param_groups(
     model,
+    vision_lr=5e-5,
     llm_lr=5e-5,
     projector_lr=1e-4,
     weight_decay=0.01,
 ):
     """
-    Create optimizer with different learning rates for LLM vs projector LoRA adapters
+    Create optimizer with different learning rates for Vision, LLM, and Projector LoRA adapters
     """
+    vision_params = []
     llm_params = []
     projector_params = []
     
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        # Check if parameter belongs to visual/projector modules
-        if "visual" in name or "projector" in name:
+        
+        # Vision encoder layers
+        if "visual.blocks" in name:
+            vision_params.append(param)
+        # Projector layers (merger + deepstack)
+        elif "visual.merger" in name or "visual.deepstack" in name:
             projector_params.append(param)
+        # Everything else is LLM
         else:
             llm_params.append(param)
     
-    print(f"LLM params: {len(llm_params)}, Projector params: {len(projector_params)}")
+    print(f"  Vision params: {len(vision_params)} tensors, lr={vision_lr}")
+    print(f"  LLM params: {len(llm_params)} tensors, lr={llm_lr}")
+    print(f"  Projector params: {len(projector_params)} tensors, lr={projector_lr}")
     
-    optimizer = torch.optim.AdamW([
-        {"params": llm_params, "lr": llm_lr, "weight_decay": weight_decay},
-        {"params": projector_params, "lr": projector_lr, "weight_decay": weight_decay},
-    ])
+    param_groups = []
+    if vision_params:
+        param_groups.append({"params": vision_params, "lr": vision_lr, "weight_decay": weight_decay})
+    if llm_params:
+        param_groups.append({"params": llm_params, "lr": llm_lr, "weight_decay": weight_decay})
+    if projector_params:
+        param_groups.append({"params": projector_params, "lr": projector_lr, "weight_decay": weight_decay})
+    
+    optimizer = torch.optim.AdamW(param_groups)
     return optimizer
+
+
 
 def train_vl_lora_with_wandb(
     # Required inputs
@@ -138,6 +153,7 @@ def train_vl_lora_with_wandb(
     # Optimization
     optimizer_config=None,
     use_separate_lrs=False,
+    vision_lr=5e-5,      # ADD THIS
     llm_lr=5e-5,
     projector_lr=1e-4,
 
@@ -171,7 +187,7 @@ def train_vl_lora_with_wandb(
 
     # 1. Initialize W&B
     print(f"\n{'='*70}")
-    print("🚀 Initializing Weights & Biases")
+    print("Initializing Weights & Biases")
     print(f"{'='*70}")
 
     full_config = {
@@ -196,6 +212,7 @@ def train_vl_lora_with_wandb(
     }
     
     if use_separate_lrs:
+        full_config["vision_lr"] = vision_lr
         full_config["llm_lr"] = llm_lr
         full_config["projector_lr"] = projector_lr
     
@@ -219,11 +236,12 @@ def train_vl_lora_with_wandb(
     if use_separate_lrs:
         optimizer = create_optimizer_with_param_groups(
             model=model,
+            vision_lr=vision_lr,
             llm_lr=llm_lr,
             projector_lr=projector_lr,
             weight_decay=optimizer_config.get("weight_decay", 0.01)
         )
-        print(f"✓ Using separate LRs: LLM={llm_lr}, Projector={projector_lr}")
+        print(f"✓ Using separate LRs: Vision={vision_lr}, LLM={llm_lr}, Projector={projector_lr}")
 
     # 3. Create training arguments
     training_args = TrainingArguments(
@@ -239,8 +257,8 @@ def train_vl_lora_with_wandb(
         per_device_eval_batch_size=batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
 
-        # Optimization - only set learning_rate if NOT using separate LRs
-        learning_rate=optimizer_config["learning_rate"] if not use_separate_lrs else None,
+        # Optimization - use dummy LR when using separate LRs
+        learning_rate=optimizer_config["learning_rate"] if not use_separate_lrs else 1e-5,
         lr_scheduler_type=optimizer_config["lr_scheduler_type"],
         warmup_steps=optimizer_config["warmup_steps"],
         weight_decay=optimizer_config.get("weight_decay", 0.01),
@@ -283,7 +301,7 @@ def train_vl_lora_with_wandb(
     
     # Print training schedule info
     print(f"\n{'='*70}")
-    print("📊 Training Schedule")
+    print("Training Schedule")
     print(f"{'='*70}")
     steps_per_epoch = len(train_dataset) // (batch_size * gradient_accumulation_steps)
     print(f"Steps per epoch: {steps_per_epoch}")
@@ -356,30 +374,31 @@ def train_vl_lora_with_wandb(
         wandb.run.summary["best_vqa_accuracy"] = vqa_callback.best_vqa_accuracy
         wandb.run.summary["best_exact_match_accuracy"] = vqa_callback.best_exact_match
 
-    # Update artifact metadata
-    artifact = wandb.Artifact(
-        name=f"lora-checkpoint-{wandb.run.id}",
-        type="model",
-        description=f"LoRA adapter checkpoint",
-        metadata={
-            "best_val_loss": lora_metrics_callback.best_val_loss,
-            "best_vqa_accuracy": vqa_callback.best_vqa_accuracy if compute_vqa_accuracy else None,
-            "best_exact_match_accuracy": vqa_callback.best_exact_match if compute_vqa_accuracy else None,
-            "train_size": len(train_dataset),
-            "val_size": len(val_dataset),
-        }
-    )
-
-    artifact.add_dir(output_dir)
-    logged_artifact = wandb.log_artifact(artifact)
-    logged_artifact.wait()
-
-    print(f"✓ Artifact uploaded: {artifact.name}")
+    # Artifact upload with error handling
+    try:
+        artifact = wandb.Artifact(
+            name=f"lora-checkpoint-{wandb.run.id}",
+            type="model",
+            description=f"LoRA adapter checkpoint",
+            metadata={
+                "best_val_loss": lora_metrics_callback.best_val_loss,
+                "best_vqa_accuracy": vqa_callback.best_vqa_accuracy if compute_vqa_accuracy else None,
+                "best_exact_match_accuracy": vqa_callback.best_exact_match if compute_vqa_accuracy else None,
+                "train_size": len(train_dataset),
+                "val_size": len(val_dataset),
+            }
+        )
+        artifact.add_dir(output_dir)
+        logged_artifact = wandb.log_artifact(artifact)
+        logged_artifact.wait()
+        print(f"✓ Artifact uploaded: {artifact.name}")
+    except Exception as e:
+        print(f"⚠ Artifact upload failed: {e}")
+        print("Model saved locally, continuing...")
 
     print(f"\n{'='*70}")
     print("Training Complete!")
     print(f"Local model: {output_dir}")
-    print(f"W&B Artifact: {artifact.name}")
     print(f"Dashboard: {wandb.run.url}")
     
     # Print final accuracy
