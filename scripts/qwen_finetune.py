@@ -22,8 +22,8 @@ from datasets import Dataset, load_dataset
 
 #torch.autograd.set_detect_anomaly(True)
 
-PLACEMENT_STRATEGY = "proj_only"
-EXPERIMENT_TYPE = "qwen3vl_vqa_projection_lora_finetune_test"
+PLACEMENT_STRATEGY = "llm_only"
+EXPERIMENT_TYPE = "qwen3vl_vqa_llm_lora_finetune"
 
 #Constants
 GCS_BUCKET = "where_you_lora_matters_thesis"
@@ -38,8 +38,8 @@ WEIGHT_DECAY = 0.01
 WARM_UP_STEPS = 500
 
 # Hyperparameter search space
-LORA_RANKS = [64]
-LEARNING_RATES = [1e-4]
+LORA_RANKS = [32]
+LEARNING_RATES = [5e-5]
 
 # Fixed LoRA settings
 LORA_ALPHA_MULTIPLIER = 2
@@ -90,13 +90,13 @@ TARGET_MODULES_PROJECTOR = [
 TARGET_VISION_PROJECTOR = TARGET_MODULES_VISION + TARGET_MODULES_PROJECTOR
 TARGET_LLM_PROJECTOR = TARGET_MODULES_LLM + TARGET_MODULES_PROJECTOR
 
-TRAIN_SIZE = 10000
-VAL_LOSS_SIZE = 500
-VAL_ACCURACY_SIZE = 500
-TEST_SIZE = 500
+TRAIN_SIZE = 20000
+VAL_LOSS_SIZE = 2000
+VAL_ACCURACY_SIZE = 2000
+TEST_SIZE = 5000
 
 # Training configuration
-EPOCHS = 2
+EPOCHS = 2.4
 MAX_STEPS = -1
 
 EVAL_STRATEGY = "steps"
@@ -117,10 +117,11 @@ EARLY_STOPPING_THRESHOLD = None
 
 # VQA Accuracy Evaluation
 COMPUTE_VQA_ACCURACY = True
-VQA_EVAL_SAMPLES = 500
+VQA_EVAL_SAMPLES = 2000
+VQA_BATCH_SIZE = 4 
 
 # Weights & Biases
-WANDB_PROJECT = "qwen3vl-experiments-vqa-projllm-test"
+WANDB_PROJECT = "qwen3vl-experiments-vqa"
 WANDB_ENTITY = None
 
 def set_random_seed(seed):
@@ -166,12 +167,13 @@ if __name__ == "__main__":
     print(f"HYPERPARAMETER VALIDATION: {total_runs} configurations")
     print("="*70)
     print(f"Random Seed: {RANDOM_SEED}")
-    print(f"Strategy: PROJ ONLY")
+    print(f"Strategy: LLM ONLY")
     print(f"Ranks: {LORA_RANKS}")
     print(f"Learning rates: {LEARNING_RATES}")
     print(f"Training samples: {TRAIN_SIZE}")
     print(f"Epochs: {EPOCHS}")
     print(f"VQA Accuracy: {'Enabled' if COMPUTE_VQA_ACCURACY else 'Disabled'}")
+    print(f"VQA Batch Size: {VQA_BATCH_SIZE}")
     print("="*70)
 
     print("\n" + "="*70)
@@ -252,14 +254,14 @@ if __name__ == "__main__":
         print(f"LoRA rank: {rank}")
         print(f"LoRA alpha: {alpha} ({LORA_ALPHA_MULTIPLIER}x)")
         print(f"Learning rate: {lr}")
-        print(f"Target modules: {TARGET_LLM_PROJECTOR}")
+        print(f"Target modules: {TARGET_MODULES_LLM}")
 
         try:
             lora_config = create_lora_config_vl(
                 lora_r=rank,
                 lora_alpha=alpha,
                 lora_dropout=LORA_DROPOUT,
-                target_modules=TARGET_LLM_PROJECTOR
+                target_modules=TARGET_MODULES_LLM
             )
 
             model, _, trainable_params, total_params = setup_vl_model_and_processor(
@@ -289,8 +291,8 @@ if __name__ == "__main__":
                 "lora_alpha": alpha,
                 "lora_alpha_multiplier": LORA_ALPHA_MULTIPLIER,
                 "lora_dropout": LORA_DROPOUT,
-                "target_modules": TARGET_LLM_PROJECTOR,
-                "num_target_modules": len(TARGET_LLM_PROJECTOR),
+                "target_modules": TARGET_MODULES_LLM,
+                "num_target_modules": len(TARGET_MODULES_LLM),
                 "learning_rate": lr,
                 "lr_scheduler_type": "cosine",
                 "min_pixels": MIN_PIXELS,
@@ -305,7 +307,7 @@ if __name__ == "__main__":
             }
 
             run_name = create_validation_run_name(rank, lr, run_id)
-            output_dir = f"./validation_outputs/{run_name}"
+            output_dir = f"./validation_outputs_final_llm/{run_name}"
 
             print(f"\nStarting training: {run_name}")
 
@@ -350,6 +352,7 @@ if __name__ == "__main__":
                 # VQA Accuracy
                 compute_vqa_accuracy=COMPUTE_VQA_ACCURACY,
                 vqa_eval_samples=VQA_EVAL_SAMPLES,
+                vqa_batch_size=VQA_BATCH_SIZE,
             )
 
             # Log success

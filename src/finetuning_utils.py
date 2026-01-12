@@ -148,6 +148,7 @@ def train_vl_lora_with_wandb(
     # VQA accuracy evaluation
     compute_vqa_accuracy=True,
     vqa_eval_samples=500,
+    vqa_batch_size=8,
 ):
     """
     Main training function with optional VQA accuracy evaluation and separate LRs.
@@ -189,6 +190,7 @@ def train_vl_lora_with_wandb(
         "compute_vqa_accuracy": compute_vqa_accuracy,
         "vqa_eval_samples": vqa_eval_samples,
         "use_separate_lrs": use_separate_lrs,
+        "vqa_batch_size": vqa_batch_size,
         **optimizer_config,
         **wandb_config,
     }
@@ -312,6 +314,7 @@ def train_vl_lora_with_wandb(
             eval_dataset=val_accuracy_dataset,
             max_new_tokens=16,
             eval_samples=vqa_eval_samples,
+            batch_size=vqa_batch_size,
         )
         callbacks.append(vqa_callback)
     
