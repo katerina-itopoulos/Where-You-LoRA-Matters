@@ -26,20 +26,26 @@ def create_lora_config_vl(lora_r, lora_alpha, lora_dropout, target_modules):
 def create_lora_config_vl_with_rank_pattern(
     lora_dropout,
     target_modules,
-    rank_pattern=None,  # Dict mapping regex patterns to ranks
+    rank_pattern=None,
     alpha_pattern=None,
 ):
     """
     Create LoRA configuration with different ranks per module pattern
     
+    Note: rank_pattern uses regex matching against the FULL module name.
+    The module names after PEFT wrapping look like:
+      - base_model.model.model.visual.blocks.0.attn.qkv
+      - base_model.model.model.visual.merger.linear_fc1
+      - base_model.model.model.language_model.layers.0.self_attn.q_proj
+    
     Example:
         rank_pattern = {
-            "visual.merger": 64,
-            "visual.blocks": 32,
-            "model.model": 32,
+            r".*visual\.blocks.*": 32,      # Vision encoder
+            r".*visual\.merger.*": 64,      # Projector
+            r".*visual\.deepstack.*": 64,   # Deepstack projectors
+            r".*language_model.*": 32,      # LLM
         }
     """
-    # Default rank for modules not matching any pattern
     default_rank = 64
     default_alpha = 128
     

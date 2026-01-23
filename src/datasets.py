@@ -440,4 +440,75 @@ def prepare_vqav2_datasets_preprocessed_ultra_lean(
     print("✓ ALL DATASETS COMPLETE")
     print("="*70)
     
-    return train_dataset, val_dataset, test_dataset
+    return train_dataset, val_dataset, test_dataset\
+
+
+# ================================
+# 2. DATASET LOADERS
+# ================================
+
+def load_dataset_from_config(config, dataset_name):
+    """Load dataset from either GCS or HuggingFace based on config"""
+    
+    if dataset_name not in config.DATASETS:
+        print(f"❌ Unknown dataset: {dataset_name}")
+        return None
+    
+    dataset_config = config.DATASETS[dataset_name]
+    source = dataset_config["source"]
+    
+    if source == "gcs":
+        return load_preprocessed_dataset(config, dataset_config["path"])
+    
+    elif source == "huggingface":
+        return load_huggingface_dataset(dataset_config)
+    
+    else:
+        print(f"❌ Unknown source: {source}")
+        return None
+
+
+def load_preprocessed_dataset(config, dataset_path):
+    """Load preprocessed dataset from GCS shards"""
+    fs = gcsfs.GCSFileSystem(token='google_default')
+    
+    shard_dir = f"{config.GCS_BUCKET}/{config.PREPROCESSED_DIR}/{dataset_path}"
+    
+    try:
+        # List all parquet shards
+        shards = [f"gs://{s}" for s in fs.ls(shard_dir) if s.endswith('.parquet')]
+        
+        if not shards:
+            print(f"⚠️ No shards found for {dataset_path}")
+            return None
+        
+        print(f"Loading {len(shards)} shards from {dataset_path}...")
+        
+        # Load all shards
+        dataset = load_dataset("parquet", data_files=shards, split="train")
+        
+        print(f"✓ Loaded {len(dataset)} samples")
+        return dataset
+        
+    except Exception as e:
+        print(f"❌ Failed to load {dataset_path}: {e}")
+        return None
+
+
+def load_huggingface_dataset(dataset_config):
+    """Load dataset directly from HuggingFace"""
+    try:
+        hf_path = dataset_config["path"]
+        split = dataset_config["split"]
+        
+        print(f"Loading {hf_path} from HuggingFace...")
+        
+        # Load dataset
+        dataset = load_dataset(hf_path, split=split)
+        
+        print(f"✓ Loaded {len(dataset)} samples from HuggingFace")
+        return dataset
+        
+    except Exception as e:
+        print(f"❌ Failed to load from HuggingFace: {e}")
+        return None

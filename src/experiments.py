@@ -1,6 +1,6 @@
 from .data_preprocessing import build_convs_from_rows
 from .inference_utils import generate_batch, run_batch_block_vectors
-from .metrics import delta_metrics
+from .vqa_metrics import delta_metrics
 
 def run_pipeline_vectors(model, processor, ds, batch_size: int = 1):
     import gc, torch
@@ -17,7 +17,7 @@ def run_pipeline_vectors(model, processor, ds, batch_size: int = 1):
     assert Vproj_all.shape[0] == T_all.shape[0]
     return V0_all, Vproj_all, T_all
 
-def run_pipeline_100(
+def run_pipeline_answers(
     model, processor, ds100, batch_size: int = 1,
     do_sample: bool = False,
     temperature: float = 0.0,
@@ -27,9 +27,11 @@ def run_pipeline_100(
     max_new_tokens: int = 50,
 ):
     import gc, torch
+    from tqdm import tqdm  # Add this import
     all_V0, all_Vproj, all_T, answers = [], [], [], []
 
-    for s in range(0, len(ds100), batch_size):
+    # Add tqdm here:
+    for s in tqdm(range(0, len(ds100), batch_size), desc="Processing batches"):
         e = min(s + batch_size, len(ds100))
         V0_l, Vp_l, T_l, ans_full = run_batch_block_vectors(
             model, processor, ds100, s, e,
@@ -51,7 +53,7 @@ def run_pipeline_100(
     assert Vproj_all.shape[0] == T_all.shape[0]
     return V0_all, Vproj_all, T_all, answers
 
-def run_pipeline_100_masked(
+def run_pipeline_answers_masked(
     model,
     processor,
     ds100,

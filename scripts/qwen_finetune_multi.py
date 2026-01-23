@@ -19,7 +19,7 @@ from src.model_utils import setup_vl_model_and_processor
 from datasets import Dataset, load_dataset
 
 PLACEMENT_STRATEGY = "vision_proj"
-EXPERIMENT_TYPE = "qwen3vl_vqa_vision_proj_lora_finetune_trial"
+EXPERIMENT_TYPE = "qwen3vl_vqa_vision_proj_lora_finetune"
 
 #Constants
 GCS_BUCKET = "where_you_lora_matters_thesis"
@@ -33,7 +33,7 @@ MAX_PIXELS = 196*32*32
 WEIGHT_DECAY = 0.01
 WARM_UP_STEPS = 500
 
-VISION_RANK = 128
+VISION_RANK = 64
 PROJECTOR_RANK = 64
 VISION_LR = 1e-4
 PROJECTOR_LR = 1e-4
@@ -125,27 +125,17 @@ def set_random_seed(seed):
     print(f"🎲 Setting Random Seed: {seed}")
     print(f"{'='*70}\n")
     
-    # Python random
     random.seed(seed)
-    
-    # NumPy
     np.random.seed(seed)
-    
-    # PyTorch
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    
-    # Make PyTorch deterministic (slower but reproducible)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    
-    # HuggingFace transformers
     set_seed(seed)
 
 if __name__ == "__main__":
     
-    # Set random seed FIRST!
     set_random_seed(RANDOM_SEED)
 
     print("="*70)
@@ -164,7 +154,6 @@ if __name__ == "__main__":
     print("LOADING PREPROCESSED DATASETS FROM GCS")
     print("="*70)
 
-    # Load processor
     processor = AutoProcessor.from_pretrained(
         MODEL_NAME,
         min_pixels=MIN_PIXELS,
@@ -205,22 +194,19 @@ if __name__ == "__main__":
     print(f"✓ Val (accuracy): {len(val_accuracy_dataset)} samples")
     print(f"✓ Test: {len(test_dataset)} samples")
 
-    # Set format for training dataset
+    # Set format for datasets
     train_cols = ["input_ids", "attention_mask", "labels", "pixel_values", "image_grid_thw"]
     train_cols = [c for c in train_cols if c in train_dataset.column_names]
     train_dataset.set_format(type="torch", columns=train_cols)
     
-    # Set format for val_loss dataset (same as training - has labels)
     val_loss_cols = ["input_ids", "attention_mask", "labels", "pixel_values", "image_grid_thw"]
     val_loss_cols = [c for c in val_loss_cols if c in val_loss_dataset.column_names]
     val_loss_dataset.set_format(type="torch", columns=val_loss_cols)
     
-    # Set format for val_accuracy dataset (for VQA metric - has answer_counts)
     val_accuracy_cols = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw", "answer", "answer_counts"]
     val_accuracy_cols = [c for c in val_accuracy_cols if c in val_accuracy_dataset.column_names]
     val_accuracy_dataset.set_format(type="torch", columns=val_accuracy_cols)
     
-    # Set format for test dataset
     test_cols = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw", "answer", "answer_counts"]
     test_cols = [c for c in test_cols if c in test_dataset.column_names]
     test_dataset.set_format(type="torch", columns=test_cols)
@@ -229,19 +215,19 @@ if __name__ == "__main__":
     print("SETTING UP MODEL WITH SEPARATE RANKS FOR VISION AND PROJECTOR")
     print("="*70)
 
-    # Create LoRA config with rank_pattern for different ranks per component
+    # Create LoRA config with rank_pattern using REGEX patterns
     lora_config = create_lora_config_vl_with_rank_pattern(
         lora_dropout=LORA_DROPOUT,
         target_modules=TARGET_VISION_PROJECTOR,
         rank_pattern={
-            "visual.blocks": VISION_RANK,       # Vision encoder blocks get rank 32
-            "visual.merger": PROJECTOR_RANK,    # Projector layers get rank 64
-            "visual.deepstack": PROJECTOR_RANK, # Deepstack mergers get rank 64
+            r".*visual\.blocks.*": VISION_RANK,        # Vision encoder blocks
+            r".*visual\.merger.*": PROJECTOR_RANK,     # Merger projector
+            r".*visual\.deepstack.*": PROJECTOR_RANK,  # Deepstack projectors
         },
         alpha_pattern={
-            "visual.blocks": VISION_RANK * 2,      # Alpha = 2 * rank
-            "visual.merger": PROJECTOR_RANK * 2,
-            "visual.deepstack": PROJECTOR_RANK * 2,
+            r".*visual\.blocks.*": VISION_RANK * 2,
+            r".*visual\.merger.*": PROJECTOR_RANK * 2,
+            r".*visual\.deepstack.*": PROJECTOR_RANK * 2,
         }
     )
 
@@ -256,28 +242,59 @@ if __name__ == "__main__":
 
     print(f"✓ Trainable params: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
 
-    # Verify rank assignment
+    # Debug: check trainable parameter names and matching
+    print("\n=== DEBUG: Trainable Parameter Names ===")
+    vision_count = 0
+    proj_count = 0
+    llm_count = 0
+    other_count = 0
+
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            print(f"  {name}")
+            if "visual.blocks" in name:
+                vision_count += 1
+            elif "visual.merger" in name or "visual.deepstack" in name:
+                proj_count += 1
+            elif "language_model" in name:
+                llm_count += 1
+            else:
+                other_count += 1
+
+    print(f"\nMatched counts:")
+    print(f"  Vision: {vision_count}")
+    print(f"  Projector: {proj_count}")
+    print(f"  LLM: {llm_count}")
+    print(f"  Other (unmatched): {other_count}")
+    print("="*50)
+
+    # Verify rank assignment - check actual rank values
+    # Verify rank by checking lora_A weight shapes
     print("\n=== Verifying LoRA Rank Assignment ===")
-    vision_lora_count = 0
-    proj_lora_count = 0
-    for name, module in model.named_modules():
-        if hasattr(module, 'r'):  # It's a LoRA module
+    vision_ranks = []
+    proj_ranks = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if 'lora_A' in name:  # lora_A shape is [rank, in_features]
+            rank = param.shape[0]
             if 'visual.blocks' in name:
-                vision_lora_count += 1
-                if vision_lora_count <= 3:  # Print first 3 for verification
-                    print(f"Vision: {name}: rank={module.r}")
+                vision_ranks.append(rank)
+                if len(vision_ranks) <= 3:
+                    print(f"Vision: {name}: rank={rank}")
             elif 'visual.merger' in name or 'visual.deepstack' in name:
-                proj_lora_count += 1
-                if proj_lora_count <= 3:  # Print first 3 for verification
-                    print(f"Projector: {name}: rank={module.r}")
-    
-    print(f"Total Vision LoRA modules: {vision_lora_count}")
-    print(f"Total Projector LoRA modules: {proj_lora_count}")
+                proj_ranks.append(rank)
+                if len(proj_ranks) <= 3:
+                    print(f"Projector: {name}: rank={rank}")
+
+    print(f"\nVision LoRA modules: {len(vision_ranks)}, ranks: {set(vision_ranks)}")
+    print(f"Projector LoRA modules: {len(proj_ranks)}, ranks: {set(proj_ranks)}")
     print("="*70)
 
-    # Setup optimizer config (needed for scheduler settings)
+    # Setup optimizer config
     optimizer_config = setup_optimizer_scheduler(
-        learning_rate=VISION_LR,  # Default, will be overridden by separate LRs
+        learning_rate=VISION_LR,
         lr_scheduler_type="cosine",
         warmup_steps=WARM_UP_STEPS,
         weight_decay=WEIGHT_DECAY,

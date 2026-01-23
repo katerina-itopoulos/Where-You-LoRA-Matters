@@ -22,8 +22,8 @@ from datasets import Dataset, load_dataset
 
 #torch.autograd.set_detect_anomaly(True)
 
-PLACEMENT_STRATEGY = "llm_only"
-EXPERIMENT_TYPE = "qwen3vl_vqa_llm_lora_finetune"
+PLACEMENT_STRATEGY = "vision_proj"
+EXPERIMENT_TYPE = "qwen3vl_vqa_vision_proj_lora_finetune"
 
 #Constants
 GCS_BUCKET = "where_you_lora_matters_thesis"
@@ -38,8 +38,8 @@ WEIGHT_DECAY = 0.01
 WARM_UP_STEPS = 500
 
 # Hyperparameter search space
-LORA_RANKS = [32]
-LEARNING_RATES = [5e-5]
+LORA_RANKS = [64]
+LEARNING_RATES = [1e-4]
 
 # Fixed LoRA settings
 LORA_ALPHA_MULTIPLIER = 2
@@ -167,7 +167,7 @@ if __name__ == "__main__":
     print(f"HYPERPARAMETER VALIDATION: {total_runs} configurations")
     print("="*70)
     print(f"Random Seed: {RANDOM_SEED}")
-    print(f"Strategy: LLM ONLY")
+    print(f"Strategy: Vision Projector")
     print(f"Ranks: {LORA_RANKS}")
     print(f"Learning rates: {LEARNING_RATES}")
     print(f"Training samples: {TRAIN_SIZE}")
@@ -254,14 +254,14 @@ if __name__ == "__main__":
         print(f"LoRA rank: {rank}")
         print(f"LoRA alpha: {alpha} ({LORA_ALPHA_MULTIPLIER}x)")
         print(f"Learning rate: {lr}")
-        print(f"Target modules: {TARGET_MODULES_LLM}")
+        print(f"Target modules: {TARGET_VISION_PROJECTOR}")
 
         try:
             lora_config = create_lora_config_vl(
                 lora_r=rank,
                 lora_alpha=alpha,
                 lora_dropout=LORA_DROPOUT,
-                target_modules=TARGET_MODULES_LLM
+                target_modules=TARGET_VISION_PROJECTOR
             )
 
             model, _, trainable_params, total_params = setup_vl_model_and_processor(
@@ -291,8 +291,8 @@ if __name__ == "__main__":
                 "lora_alpha": alpha,
                 "lora_alpha_multiplier": LORA_ALPHA_MULTIPLIER,
                 "lora_dropout": LORA_DROPOUT,
-                "target_modules": TARGET_MODULES_LLM,
-                "num_target_modules": len(TARGET_MODULES_LLM),
+                "target_modules": TARGET_VISION_PROJECTOR,
+                "num_target_modules": len(TARGET_VISION_PROJECTOR),
                 "learning_rate": lr,
                 "lr_scheduler_type": "cosine",
                 "min_pixels": MIN_PIXELS,
@@ -307,7 +307,7 @@ if __name__ == "__main__":
             }
 
             run_name = create_validation_run_name(rank, lr, run_id)
-            output_dir = f"./validation_outputs_final_llm/{run_name}"
+            output_dir = f"./validation_outputs_final_vision_proj/{run_name}"
 
             print(f"\nStarting training: {run_name}")
 
