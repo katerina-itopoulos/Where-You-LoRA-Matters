@@ -20,8 +20,24 @@ import json
 import numpy as np
 import gc
 import shutil
-from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+import random
+from transformers import AutoProcessor, Qwen3VLForConditionalGeneration, set_seed
 from src.experiments import run_pipeline_answers
+
+# ================================
+# SEED EVERYTHING FOR REPRODUCIBILITY
+# ================================
+def seed_everything(seed=42):
+    """Set seeds for reproducibility"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    set_seed(seed)  # HuggingFace transformers seed
+    print(f"✓ All random seeds set to {seed}")
 
 # ================================
 # CONFIG
@@ -31,38 +47,42 @@ class EvalConfig:
     """Configuration for evaluation"""
     MODEL_NAME = "Qwen/Qwen3-VL-8B-Instruct"
     GCS_BUCKET = "where_you_lora_matters_thesis"
-    BATCH_SIZE = 1
+    BATCH_SIZE = 1  #  Set to 1 for now (batching has bugs)
+    SEED = 42  # ⬅️ Master seed for reproducibility
     
     # Image resolution - same as training
     MIN_PIXELS = 196 * 32 * 32  # ~448x448 (same as training)
     MAX_PIXELS = 196 * 32 * 32
     
     # LoRA checkpoint (set to None for base model)
-    LORA_CHECKPOINT = None
-    IS_BASELINE = True 
+    LORA_CHECKPOINT = "gs://where_you_lora_matters_thesis/artifacts/Qwen3-VL/vision_llm/validation_outputs_final_vision_llm/vision_llm_r32_32_lr0.0001_0.0001/checkpoint-6000"
+    IS_BASELINE = False 
     
     # Output directory
-    EXPERIMENT_NAME = "baseline"  # Change for each experiment
-    OUTPUT_DIR = f"experiments/{EXPERIMENT_NAME}"
+    EXPERIMENT_NAME = "vision_llm"  # Change for each experiment
+    OUTPUT_DIR = f"experiments_qwen3vl/{EXPERIMENT_NAME}"
     
     # VQAv2 split configuration (matching your training setup)
     VQAV2_TRAIN_SIZE = 20000
     VQAV2_VAL_SIZE = 2000
-    # Test set = validation split, skipping train+val samples
     
     # Evaluation settings
     EVAL_VQAV2 = True
     EVAL_DASH_B = True
     EVAL_HALLUSIONBENCH = True
-    EVAL_VQA_VS = True  # Set to True once VQA-VS is reprocessed
+    EVAL_VQA_VS = True
     
-    # Sampling for quick tests (set to None for full eval)
-    VQAV2_TEST_SAMPLE_SIZE = 100  # None for full test set (192,354 samples after skipping train+val)
-    DASH_B_SAMPLE_SIZE = 100   # Already small dataset
-    HALLUSION_SAMPLE_SIZE = 100  # Already small dataset
-    VQA_VS_SAMPLE_SIZE = 100
+    # Sampling for tests (set to None for full eval)
+    VQAV2_TEST_SAMPLE_SIZE = 2000  # Full test set
+    DASH_B_SAMPLE_SIZE = None   # Full dataset
+    HALLUSION_SAMPLE_SIZE = None  # Full dataset
+    VQA_VS_SAMPLE_SIZE = 2000  # Full OOD sets
 
 config = EvalConfig()
+
+# ⬇SET SEEDS BEFORE ANYTHING ELSE
+seed_everything(config.SEED)
+
 fs = gcsfs.GCSFileSystem(token='google_default')
 
 # ================================
@@ -82,7 +102,14 @@ def load_model_and_processor(config, lora_checkpoint=None):
         min_pixels=config.MIN_PIXELS,
         max_pixels=config.MAX_PIXELS,
     )
+
+    # Set left padding for generation
+    processor.tokenizer.padding_side = "left"
+    if processor.tokenizer.pad_token_id is None:
+        processor.tokenizer.pad_token_id = processor.tokenizer.eos_token_id
+
     print("✓ Processor loaded")
+    print(f"  Padding side: {processor.tokenizer.padding_side}")
     print(f"  Image resolution: ~448x448 (min/max pixels: {config.MIN_PIXELS:,})")
     
     print("\n[2/3] Loading base model...")
@@ -152,6 +179,7 @@ def load_model_and_processor(config, lora_checkpoint=None):
 print("Loading model and processor...")
 model, processor = load_model_and_processor(config, config.LORA_CHECKPOINT)
 
+
 # --------------------------------
 # Dataset-specific formatting
 # --------------------------------
@@ -209,10 +237,7 @@ def format_dataset_for_pipeline(dataset, dataset_type):
 
 def add_prompt_suffix(rows, dataset_type, is_baseline=False):
     """Add dataset-specific prompt suffixes"""
-    if dataset_type == "dash_b":
-        for row in rows:
-            row['question'] = f"{row['question']} Answer with yes or no only."
-    elif dataset_type == "hallusionbench":
+    if dataset_type == "hallusionbench":
         for row in rows:
             row['question'] = f"{row['question']} Answer with yes or no only."
     elif dataset_type in ["vqav2", "vqa_vs"] and is_baseline:  # Only for baseline
@@ -236,15 +261,11 @@ def parse_answer(answer, dataset_type):
         return answer.strip()
 
 # --------------------------------
-# Evaluation metrics
+# Evaluation metrics (WITH SPECIFICITY)
 # --------------------------------
 
 def compute_vqa_accuracy(predictions, references):
-    """
-    VQA-style accuracy (for VQAv2 and VQA-VS)
-    Reference format: list of answer dicts [{"answer": "yes", ...}, ...]
-    Formula: Acc(ans) = min(# humans that said ans / 3, 1)
-    """
+    """VQA-style accuracy (for VQAv2 and VQA-VS)"""
     correct = 0
     total = len(predictions)
     
@@ -264,10 +285,11 @@ def compute_vqa_accuracy(predictions, references):
     
     return {"accuracy": correct / total if total > 0 else 0.0}
 
+
 def compute_binary_classification_metrics(predictions, references, dataset_name=""):
     """
     Binary classification metrics for DASH-B and HallusionBench
-    Computes: Accuracy, Precision, Recall, F1, Yes rate
+    Computes: Accuracy, Precision, Recall, Specificity, F1, Yes rate
     """
     tp = fp = tn = fn = 0
     
@@ -287,7 +309,8 @@ def compute_binary_classification_metrics(predictions, references, dataset_name=
     total = tp + tn + fp + fn
     accuracy = (tp + tn) / total if total > 0 else 0.0
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0  # Sensitivity/TPR
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0  # ⬅️ TRUE NEGATIVE RATE
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
     yes_rate = (tp + fp) / total if total > 0 else 0.0
     
@@ -295,6 +318,7 @@ def compute_binary_classification_metrics(predictions, references, dataset_name=
         'accuracy': accuracy,
         'precision': precision,
         'recall': recall,
+        'specificity': specificity,  # ⬅️ ADDED
         'f1': f1,
         'yes_rate': yes_rate,
         'tp': tp,
@@ -623,6 +647,7 @@ summary = {
     'lora_checkpoint': config.LORA_CHECKPOINT,
     'model_name': config.MODEL_NAME,
     'batch_size': config.BATCH_SIZE,
+    'seed': config.SEED,  # Record seed in summary
     'vqav2_split_info': {
         'train_size': config.VQAV2_TRAIN_SIZE,
         'val_size': config.VQAV2_VAL_SIZE,
@@ -630,6 +655,7 @@ summary = {
     },
     'results': all_results
 }
+
 
 summary_path = f"{config.OUTPUT_DIR}/evaluation_summary.json"
 gcs_summary_path = f"gs://{config.GCS_BUCKET}/{summary_path}"

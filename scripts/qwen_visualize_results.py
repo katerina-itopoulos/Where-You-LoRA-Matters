@@ -20,11 +20,12 @@ GCS_BUCKET = "where_you_lora_matters_thesis"
 
 # All experiments you want to compare
 EXPERIMENTS = {
-    "baseline": "experiments/baseline",
-    "llm_only": "experiments/llm_only",
-    "llm_proj": "experiments/llm_proj",
-    "projector_only": "experiments/proj_only",
-    "vision_projector": "experiments/vision_only",
+    "baseline": "experiments_qwen3vl/baseline",
+    "llm_only": "experiments_qwen3vl/llm_only",
+    "llm_proj": "experiments_qwen3vl/llm_proj",
+    "projector_only": "experiments_qwen3vl/proj_only",
+    "vision_projector": "experiments_qwen3vl/vision_proj",
+    "vision_llm": "experiments_qwen3vl/vision_llm",
 }
 
 WANDB_PROJECT = "where-you-lora-matters"
@@ -44,7 +45,7 @@ def load_features_from_gcs(feature_file):
     
     data = np.load(local_path, allow_pickle=True)
     
-    # Force proper numeric arrays (THIS IS THE FIX)
+    # Force proper numeric arrays
     Vproj = np.asarray(data["Vproj"], dtype=np.float32)
     T_fused = np.asarray(data["T_fused"], dtype=np.float32)
     
@@ -97,34 +98,33 @@ for model_name, output_dir in EXPERIMENTS.items():
         Vproj, T_fused = load_features_from_gcs(feature_file)
         collapse_metrics = summarize_vectors(Vproj, T_fused)
         
-        # -------- Task metrics (CRITICAL FIX) --------
+        # -------- Task metrics (FIXED - no predictions) --------
         result_file = f"{results_path}{dataset_name}_results.json"
         try:
             results = load_results_from_gcs(result_file)
             
-            # Merge both schemas
-            task_metrics = {
-                **results,
-                **results.get("metrics", {})
-            }
+            # Only get metrics, NOT predictions
+            task_metrics = results.get("metrics", {})
             
+            # Get metadata separately
             num_samples = results.get("num_samples", 0)
+            
         except Exception as e:
             print(f"    ⚠️ Could not load results: {e}")
             task_metrics = {}
             num_samples = 0
         
-        # -------- Add specificity if possible --------
-        tp = task_metrics.get("tp")
-        fp = task_metrics.get("fp")
-        tn = task_metrics.get("tn")
-        fn = task_metrics.get("fn")
+        # -------- Add specificity if not already present --------
+        if "specificity" not in task_metrics:
+            tp = task_metrics.get("tp")
+            fp = task_metrics.get("fp")
+            tn = task_metrics.get("tn")
+            fn = task_metrics.get("fn")
+            
+            if tn is not None and fp is not None and (tn + fp) > 0:
+                task_metrics["specificity"] = tn / (tn + fp)
         
-        if tn is not None and fp is not None:
-            specificity = tn / (tn + fp) if (tn + fp) > 0 else float("nan")
-            task_metrics["specificity"] = specificity
-        
-        # -------- Build row --------
+        # -------- Build row (WITHOUT predictions) --------
         row = {
             "model": model_name,
             **task_metrics,
@@ -144,6 +144,9 @@ for model_name, output_dir in EXPERIMENTS.items():
 for dataset_name, rows in all_tables.items():
     print(f"\n📊 Logging table for dataset: {dataset_name}")
     
+    # Check if ANY row has specificity
+    has_specificity = any("specificity" in r for r in rows)
+    
     # Format mean/std into "mean ± std"
     formatted_rows = []
     for r in rows:
@@ -158,6 +161,11 @@ for dataset_name, rows in all_tables.items():
                 continue
             else:
                 fr[k] = v
+        
+        # Add specificity as None if this row doesn't have it but others do
+        if has_specificity and "specificity" not in fr:
+            fr["specificity"] = None
+            
         formatted_rows.append(fr)
     
     columns = list(formatted_rows[0].keys())

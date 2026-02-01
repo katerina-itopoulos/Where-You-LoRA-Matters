@@ -18,8 +18,8 @@ from src.finetuning_utils import (
 from src.model_utils import setup_vl_model_and_processor
 from datasets import Dataset, load_dataset
 
-PLACEMENT_STRATEGY = "vision_proj"
-EXPERIMENT_TYPE = "qwen3vl_vqa_vision_proj_lora_finetune"
+PLACEMENT_STRATEGY = "vision_llm" 
+EXPERIMENT_TYPE = "qwen3vl_vqa_vision_llm_lora_finetune" 
 
 #Constants
 GCS_BUCKET = "where_you_lora_matters_thesis"
@@ -33,10 +33,10 @@ MAX_PIXELS = 196*32*32
 WEIGHT_DECAY = 0.01
 WARM_UP_STEPS = 500
 
-VISION_RANK = 64
-PROJECTOR_RANK = 64
+VISION_RANK = 32
+LLM_RANK = 32
 VISION_LR = 1e-4
-PROJECTOR_LR = 1e-4
+LLM_LR = 1e-4 
 
 LORA_DROPOUT = 0.05
 
@@ -83,14 +83,15 @@ TARGET_MODULES_PROJECTOR = [
 
 TARGET_VISION_PROJECTOR = TARGET_MODULES_VISION + TARGET_MODULES_PROJECTOR
 TARGET_LLM_PROJECTOR = TARGET_MODULES_LLM + TARGET_MODULES_PROJECTOR
+TARGET_VISION_LLM = TARGET_MODULES_VISION + TARGET_MODULES_LLM
 
-TRAIN_SIZE = 10000
+TRAIN_SIZE = 20000
 VAL_LOSS_SIZE = 500
 VAL_ACCURACY_SIZE = 500
 TEST_SIZE = 500
 
 # Training configuration
-EPOCHS = 2
+EPOCHS = 2.4
 MAX_STEPS = -1
 
 EVAL_STRATEGY = "steps"
@@ -114,7 +115,7 @@ COMPUTE_VQA_ACCURACY = True
 VQA_EVAL_SAMPLES = 500
 
 # Weights & Biases
-WANDB_PROJECT = "qwen3vl-experiments-vqa-projvision-test"
+WANDB_PROJECT = "qwen3vl-experiments-vqa"
 WANDB_ENTITY = None
 
 def set_random_seed(seed):
@@ -142,9 +143,9 @@ if __name__ == "__main__":
     print(f"VISION + PROJECTOR TRIAL RUN")
     print("="*70)
     print(f"Random Seed: {RANDOM_SEED}")
-    print(f"Strategy: VISION + PROJECTOR (separate ranks & LRs)")
+    print(f"Strategy: VISION + LLM")
     print(f"Vision: rank {VISION_RANK}, lr {VISION_LR}")
-    print(f"Projector: rank {PROJECTOR_RANK}, lr {PROJECTOR_LR}")
+    print(f"LLM: rank {LLM_RANK}, lr {LLM_LR}")
     print(f"Training samples: {TRAIN_SIZE}")
     print(f"Epochs: {EPOCHS}")
     print(f"VQA Accuracy: {'Enabled' if COMPUTE_VQA_ACCURACY else 'Disabled'}")
@@ -218,16 +219,14 @@ if __name__ == "__main__":
     # Create LoRA config with rank_pattern using REGEX patterns
     lora_config = create_lora_config_vl_with_rank_pattern(
         lora_dropout=LORA_DROPOUT,
-        target_modules=TARGET_VISION_PROJECTOR,
+        target_modules=TARGET_VISION_LLM,  # CHANGED
         rank_pattern={
             r".*visual\.blocks.*": VISION_RANK,        # Vision encoder blocks
-            r".*visual\.merger.*": PROJECTOR_RANK,     # Merger projector
-            r".*visual\.deepstack.*": PROJECTOR_RANK,  # Deepstack projectors
+            r".*language_model.*": LLM_RANK,           # LLM attention layers - CHANGED
         },
         alpha_pattern={
             r".*visual\.blocks.*": VISION_RANK * 2,
-            r".*visual\.merger.*": PROJECTOR_RANK * 2,
-            r".*visual\.deepstack.*": PROJECTOR_RANK * 2,
+            r".*language_model.*": LLM_RANK * 2,       # CHANGED
         }
     )
 
@@ -242,6 +241,7 @@ if __name__ == "__main__":
 
     print(f"✓ Trainable params: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
 
+    # Debug: check trainable parameter names and matching
     # Debug: check trainable parameter names and matching
     print("\n=== DEBUG: Trainable Parameter Names ===")
     vision_count = 0
@@ -263,7 +263,7 @@ if __name__ == "__main__":
 
     print(f"\nMatched counts:")
     print(f"  Vision: {vision_count}")
-    print(f"  Projector: {proj_count}")
+    print(f"  Projector: {proj_count} (should be 0!)")  # CHANGED
     print(f"  LLM: {llm_count}")
     print(f"  Other (unmatched): {other_count}")
     print("="*50)
@@ -272,7 +272,7 @@ if __name__ == "__main__":
     # Verify rank by checking lora_A weight shapes
     print("\n=== Verifying LoRA Rank Assignment ===")
     vision_ranks = []
-    proj_ranks = []
+    llm_ranks = []  # CHANGED
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
@@ -283,13 +283,13 @@ if __name__ == "__main__":
                 vision_ranks.append(rank)
                 if len(vision_ranks) <= 3:
                     print(f"Vision: {name}: rank={rank}")
-            elif 'visual.merger' in name or 'visual.deepstack' in name:
-                proj_ranks.append(rank)
-                if len(proj_ranks) <= 3:
-                    print(f"Projector: {name}: rank={rank}")
+            elif 'language_model' in name:  # CHANGED
+                llm_ranks.append(rank)
+                if len(llm_ranks) <= 3:
+                    print(f"LLM: {name}: rank={rank}")
 
     print(f"\nVision LoRA modules: {len(vision_ranks)}, ranks: {set(vision_ranks)}")
-    print(f"Projector LoRA modules: {len(proj_ranks)}, ranks: {set(proj_ranks)}")
+    print(f"LLM LoRA modules: {len(llm_ranks)}, ranks: {set(llm_ranks)}")  # CHANGED
     print("="*70)
 
     # Setup optimizer config
@@ -306,13 +306,13 @@ if __name__ == "__main__":
         "model_name": MODEL_NAME,
         "random_seed": RANDOM_SEED,
         "vision_rank": VISION_RANK,
-        "projector_rank": PROJECTOR_RANK,
+        "llm_rank": LLM_RANK,  # CHANGED
         "vision_lr": VISION_LR,
-        "projector_lr": PROJECTOR_LR,
+        "llm_lr": LLM_LR,  # CHANGED
         "lora_dropout": LORA_DROPOUT,
         "target_modules_vision": TARGET_MODULES_VISION,
-        "target_modules_projector": TARGET_MODULES_PROJECTOR,
-        "num_target_modules": len(TARGET_VISION_PROJECTOR),
+        "target_modules_llm": TARGET_MODULES_LLM,  # CHANGED
+        "num_target_modules": len(TARGET_VISION_LLM),  # CHANGED
         "lr_scheduler_type": "cosine",
         "min_pixels": MIN_PIXELS,
         "max_pixels": MAX_PIXELS,
@@ -325,8 +325,8 @@ if __name__ == "__main__":
         "trainable_percentage": 100*trainable_params/total_params,
     }
 
-    run_name = f"vision_proj_trial_r{VISION_RANK}_{PROJECTOR_RANK}_lr{VISION_LR}_{PROJECTOR_LR}"
-    output_dir = f"./validation_outputs/{run_name}"
+    run_name = f"vision_llm_r{VISION_RANK}_{LLM_RANK}_lr{VISION_LR}_{LLM_LR}"  # CHANGED
+    output_dir = f"./validation_outputs_final_vision_llm/{run_name}"
 
     print(f"\nStarting training: {run_name}")
 
@@ -367,7 +367,7 @@ if __name__ == "__main__":
             optimizer_config=optimizer_config,
             use_separate_lrs=True,
             vision_lr=VISION_LR,
-            projector_lr=PROJECTOR_LR,
+            llm_lr=LLM_LR,  # CHANGED - now using LLM_LR
 
             # Early stopping
             early_stopping_patience=EARLY_STOPPING_PATIENCE,

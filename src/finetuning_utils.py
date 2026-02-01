@@ -1,12 +1,113 @@
 import os
 import wandb
 from peft import LoraConfig, TaskType, get_peft_model
-from transformers import EarlyStoppingCallback, Trainer, TrainingArguments
+from transformers import EarlyStoppingCallback, Trainer, TrainingArguments, TrainerCallback
 import torch
 
 from .data_preprocessing import VLDataCollatorPadTorch
 from .wandb_utils import WandBLoRAMetricsCallback
 from .validation_utils import VQAAccuracyCallback
+
+
+class SaveAtSpecificStepsCallback(TrainerCallback):
+    """
+    Callback to save checkpoints at specific training steps.
+    Saves step 0 at the beginning of training.
+    """
+    def __init__(self, save_steps_list, output_dir, processor=None):
+        self.save_steps_list = set(save_steps_list) if save_steps_list else set()
+        self.output_dir = output_dir
+        self.processor = processor
+        self.saved_steps = set()
+    
+    def on_train_begin(self, args, state, control, **kwargs):
+        """Save checkpoint at step 0 (before any training)"""
+        if 0 in self.save_steps_list and 0 not in self.saved_steps:
+            checkpoint_dir = os.path.join(self.output_dir, "checkpoint-0")
+            print(f"\n💾 Saving initial checkpoint (step 0) to {checkpoint_dir}")
+            
+            # Save model
+            kwargs['model'].save_pretrained(checkpoint_dir)
+            
+            # Save processor
+            if self.processor:
+                self.processor.save_pretrained(checkpoint_dir)
+            
+            self.saved_steps.add(0)
+            print(f"✓ Initial checkpoint saved at step 0")
+    
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step in self.save_steps_list and state.global_step not in self.saved_steps:
+            checkpoint_dir = os.path.join(self.output_dir, f"checkpoint-{state.global_step}")
+            print(f"\n💾 Saving checkpoint at step {state.global_step} to {checkpoint_dir}")
+            
+            # Save model
+            kwargs['model'].save_pretrained(checkpoint_dir)
+            
+            # Save processor
+            if self.processor:
+                self.processor.save_pretrained(checkpoint_dir)
+            
+            self.saved_steps.add(state.global_step)
+            print(f"✓ Checkpoint saved at step {state.global_step}")
+
+
+def add_instruction_to_dataset(dataset, processor, instruction="Provide a short answer (one or a few words)."):
+    """
+    Add instruction to pre-tokenized dataset by tokenizing the instruction 
+    and appending it to existing input_ids.
+    
+    Memory-efficient: processes in batches without keeping everything in memory.
+    """
+    import torch
+    
+    # Tokenize the instruction once
+    instruction_tokens = processor.tokenizer(
+        " " + instruction,  # Space prefix to separate from question
+        add_special_tokens=False,
+        return_tensors="pt"
+    )['input_ids'][0]
+    
+    instruction_length = len(instruction_tokens)
+    
+    def add_instruction_tokens(example):
+        # Concatenate instruction tokens to input_ids
+        input_ids = example['input_ids']
+        attention_mask = example['attention_mask']
+        
+        # Convert to tensor if not already
+        if not isinstance(input_ids, torch.Tensor):
+            input_ids = torch.tensor(input_ids)
+        if not isinstance(attention_mask, torch.Tensor):
+            attention_mask = torch.tensor(attention_mask)
+        
+        # Append instruction tokens
+        new_input_ids = torch.cat([input_ids, instruction_tokens])
+        new_attention_mask = torch.cat([attention_mask, torch.ones(instruction_length, dtype=attention_mask.dtype)])
+        
+        # Update labels if present AND if it's numeric (training/val_loss datasets)
+        # Skip for val_accuracy_dataset which has string answers
+        if 'labels' in example:
+            labels = example['labels']
+            # Only process if labels is numeric (not string like in val_accuracy)
+            if not isinstance(labels, str):
+                if not isinstance(labels, torch.Tensor):
+                    labels = torch.tensor(labels)
+                new_labels = torch.cat([labels, torch.full((instruction_length,), -100, dtype=labels.dtype)])
+                example['labels'] = new_labels
+        
+        example['input_ids'] = new_input_ids
+        example['attention_mask'] = new_attention_mask
+        
+        return example
+    
+    # Process without keeping in memory, let it stream to disk
+    return dataset.map(
+        add_instruction_tokens, 
+        desc="Adding instruction tokens to dataset",
+        batched=False,
+        num_proc=1  # Single process to avoid memory issues
+    )
 
 
 def create_lora_config_vl(lora_r, lora_alpha, lora_dropout, target_modules):
@@ -151,6 +252,7 @@ def train_vl_lora_with_wandb(
     eval_steps=None,
     save_strategy=None,
     save_steps=None,
+    save_checkpoints_at_steps=None,  # NEW: List of specific steps to save checkpoints [0, 500, 1000, ...]
 
     # Batch size
     batch_size=1,
@@ -159,7 +261,7 @@ def train_vl_lora_with_wandb(
     # Optimization
     optimizer_config=None,
     use_separate_lrs=False,
-    vision_lr=5e-5,      # ADD THIS
+    vision_lr=5e-5,
     llm_lr=5e-5,
     projector_lr=1e-4,
 
@@ -171,9 +273,16 @@ def train_vl_lora_with_wandb(
     compute_vqa_accuracy=True,
     vqa_eval_samples=500,
     vqa_batch_size=8,
+    
+    # Prompt instruction
+    add_short_answer_instruction=True,  # NEW: Add "Provide a short answer" to questions
 ):
     """
     Main training function with optional VQA accuracy evaluation and separate LRs.
+    
+    New features:
+    - save_checkpoints_at_steps: List of steps to save checkpoints (e.g., [0, 500, 1000, 1500, 2000, 2500, 3000])
+    - add_short_answer_instruction: If True, adds "Provide a short answer (one or a few words)." to all questions
     """
 
     if optimizer_config is None:
@@ -190,6 +299,27 @@ def train_vl_lora_with_wandb(
     
     if eval_strategy == "steps" and eval_steps is None:
         raise ValueError("eval_steps must be provided when eval_strategy='steps'")
+
+    # Add instruction to datasets if requested
+    if add_short_answer_instruction:
+        print(f"\n{'='*70}")
+        print("Adding short-answer instruction to EVAL datasets only")
+        print(f"{'='*70}")
+        instruction = "Provide a short answer (one or a few words)."
+        print(f"Instruction: '{instruction}'")
+        print("Tokenizing instruction and appending to input_ids...")
+        print("Note: Training set uses labels as implicit instruction (memory efficient)")
+        
+        # Only add to validation/test sets (much smaller, won't OOM)
+        val_dataset = add_instruction_to_dataset(val_dataset, processor, instruction)
+        if val_accuracy_dataset:
+            val_accuracy_dataset = add_instruction_to_dataset(val_accuracy_dataset, processor, instruction)
+        if test_dataset:
+            test_dataset = add_instruction_to_dataset(test_dataset, processor, instruction)
+        
+        print(f"✓ Instruction tokens added to validation/test datasets")
+        print(f"✓ Training learns format from short labels (no instruction needed)")
+        print(f"{'='*70}\n")
 
     # 1. Initialize W&B
     print(f"\n{'='*70}")
@@ -213,6 +343,8 @@ def train_vl_lora_with_wandb(
         "vqa_eval_samples": vqa_eval_samples,
         "use_separate_lrs": use_separate_lrs,
         "vqa_batch_size": vqa_batch_size,
+        "add_short_answer_instruction": add_short_answer_instruction,
+        "save_checkpoints_at_steps": save_checkpoints_at_steps,
         **optimizer_config,
         **wandb_config,
     }
@@ -285,7 +417,7 @@ def train_vl_lora_with_wandb(
         # Checkpointing
         save_strategy=save_strategy,
         save_steps=save_steps if save_strategy == "steps" else None,
-        save_total_limit=2,
+        save_total_limit=None,  # Keep all checkpoints (especially for temporal analysis)
         load_best_model_at_end=False,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
@@ -315,6 +447,9 @@ def train_vl_lora_with_wandb(
     print(f"Total steps: {steps_per_epoch * epochs}")
     print(f"Eval strategy: {eval_strategy}")
     print(f"VQA Accuracy: {'Enabled' if compute_vqa_accuracy else 'Disabled'}")
+    print(f"Short-answer instruction: {'Added' if add_short_answer_instruction else 'Not added'}")
+    if save_checkpoints_at_steps:
+        print(f"Checkpoints will be saved at steps: {save_checkpoints_at_steps}")
 
     if eval_strategy == "steps":
         print(f"Eval every: {eval_steps} steps")
@@ -342,6 +477,15 @@ def train_vl_lora_with_wandb(
         )
         callbacks.append(vqa_callback)
     
+    # NEW: Checkpoint saving callback
+    if save_checkpoints_at_steps:
+        checkpoint_callback = SaveAtSpecificStepsCallback(
+            save_steps_list=save_checkpoints_at_steps,
+            output_dir=output_dir,
+            processor=processor  # Pass processor so it can be saved
+        )
+        callbacks.append(checkpoint_callback)
+    
     # Early stopping
     if early_stopping_patience is not None and early_stopping_patience > 0:
         early_stopping = EarlyStoppingCallback(
@@ -367,7 +511,7 @@ def train_vl_lora_with_wandb(
     print("Starting training...")
     trainer.train()
     
-    print("\nSaving model...")
+    print("\nSaving final model...")
     trainer.save_model(output_dir)
     test_dataset.save_to_disk(os.path.join(output_dir, "test_dataset"))
 
