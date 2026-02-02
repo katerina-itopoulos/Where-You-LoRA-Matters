@@ -6,7 +6,7 @@ import torch
 import wandb
 from transformers import TrainerCallback
 import itertools
-
+import os
 
 def generate_validation_configs(lora_ranks, learning_rates, lora_alpha_multiplier):
     """Generate all combinations of hyperparameters for validation."""
@@ -209,6 +209,35 @@ class VQAAccuracyCallback(TrainerCallback):
         
         vqa_accuracy = total_vqa_score / num_samples if num_samples > 0 else 0.0
         exact_match_accuracy = total_exact_match / num_samples if num_samples > 0 else 0.0
+
+        # ============================================
+        # SAVE PREDICTIONS TO FILE
+        # ============================================
+        predictions_output = {
+            "step": state.global_step,
+            "epoch": state.epoch if state.epoch else 0,
+            "vqa_accuracy": vqa_accuracy,
+            "exact_match_accuracy": exact_match_accuracy,
+            "num_samples": num_samples,
+            "predictions": [
+                {
+                    "prediction": pred,
+                    "ground_truth": most_common,
+                    "answer_counts": ans_counts,
+                    "vqa_score": self.compute_vqa_score(pred, ans_counts),
+                    "exact_match": self.compute_exact_match(pred, most_common),
+                }
+                for pred, most_common, ans_counts in zip(all_predictions, all_most_common, all_answer_counts)
+            ]
+        }
+        
+        predictions_file = os.path.join(args.output_dir, f"val_predictions_step_{state.global_step}.json")
+        os.makedirs(args.output_dir, exist_ok=True)
+        with open(predictions_file, 'w') as f:
+            json.dump(predictions_output, f, indent=2)
+        print(f"💾 Saved {len(all_predictions)} predictions to: {predictions_file}")
+        # ============================================
+        
         
         wandb.log({
             "eval/vqa_accuracy": vqa_accuracy,
