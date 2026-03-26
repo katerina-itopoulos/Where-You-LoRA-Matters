@@ -1,6 +1,6 @@
 # Where You LoRA Matters
 
-Master's thesis investigating how LoRA adapter placement affects modality collapse in Vision-Language Models (VLMs).
+Master's thesis investigating how LoRA adapter placement affects modality collapse in Multimodal Large Language Models
 
 ## Overview
 
@@ -8,14 +8,14 @@ This repository contains the code for fine-tuning and evaluating **Qwen3-VL-8B**
 
 ### LoRA Configurations
 
-| Configuration | Adapted Modules | 
-|---|---|---|
-| **LLM-only** | Language model attention layers | 
-| **Projector-only** | Vision-language projector | 
-| **Vision + Projector** | Vision encoder + projector | 
-| **LLM + Projector** | Language model + projector | 
-| **Vision + LLM** | Vision encoder + language model | 
-| **Vision + LLM + Projector** | Vision encoder + language model + projector | 
+| Configuration | Adapted Modules |
+|---------------|-----------------|
+| **LLM-only** | Language model attention layers |
+| **Projector-only** | Vision-language projector |
+| **Vision + Projector** | Vision encoder + projector |
+| **LLM + Projector** | Language model + projector |
+| **Vision + LLM** | Vision encoder + language model |
+| **Vision + LLM + Projector** | Vision encoder + language model + projector |
 
 ### Collapse Metrics
 
@@ -44,12 +44,13 @@ Models are evaluated on:
 
 ### Installation
 
+**Option 1: Using pip + venv**
 ```bash
 # Clone the repository
 git clone https://github.com/katerina-itopoulos/Where-You-LoRA-Matters.git
 cd Where-You-LoRA-Matters
 
-# Create virtual environment or conda env
+# Create virtual environment
 python -m venv thesis_env
 source thesis_env/bin/activate  # On Windows: thesis_env\Scripts\activate
 
@@ -61,8 +62,25 @@ pip install -r requirements.txt
 wandb login
 ```
 
-## Repository Structure
+**Option 2: Using conda**
+```bash
+# Clone the repository
+git clone https://github.com/katerina-itopoulos/Where-You-LoRA-Matters.git
+cd Where-You-LoRA-Matters
 
+# Create conda environment
+conda create -n thesis_env python=3.10
+conda activate thesis_env
+
+# Install dependencies
+pip install --upgrade pip
+pip install -r requirements.txt
+
+# Login to Weights & Biases
+wandb login
+```
+
+## Repository Structure
 ```
 Where-You-LoRA-Matters/
 ├── scripts/
@@ -94,7 +112,6 @@ Where-You-LoRA-Matters/
 ### 1. Data Preprocessing
 
 Preprocess the VQAv2 and VQA-VS datasets into the expected parquet format:
-
 ```bash
 python scripts/process_datasets_vqa.py
 python scripts/process_dataset_vqa_vs.py
@@ -105,13 +122,11 @@ python scripts/process_dataset_vqa_vs.py
 There are two fine-tuning scripts depending on the LoRA configuration:
 
 **`finetune.py`** — for single-component configurations where one uniform LoRA rank and learning rate applies to all target modules (LLM-only, Projector-only). Set `PLACEMENT_STRATEGY`, `TARGET_MODULES`, and `LEARNING_RATE` at the top of the script:
-
 ```bash
 python scripts/finetune.py
 ```
 
 **`finetune_multi.py`** — for multi-component configurations that require per-module rank patterns and separate learning rates (Vision+LLM, Vision+Projector, LLM+Projector, Vision+LLM+Projector). Set `PLACEMENT_STRATEGY`, target module combination, and per-component ranks/LRs at the top:
-
 ```bash
 python scripts/finetune_multi.py
 ```
@@ -127,7 +142,6 @@ Key hyperparameters (configured in scripts):
 ### 3. Evaluation
 
 Run benchmark evaluation on a fine-tuned checkpoint:
-
 ```bash
 python scripts/evaluate.py
 ```
@@ -135,7 +149,6 @@ python scripts/evaluate.py
 ### 4. Analysis
 
 Generate qualitative HTML reports and push collapse metrics to W&B:
-
 ```bash
 python scripts/qualitative_analysis.py
 python scripts/visualize_results_wandb.py
@@ -144,7 +157,6 @@ python scripts/visualize_results_wandb.py
 ## Citation
 
 If you find this work useful, please cite:
-
 ```bibtex
 @mastersthesis{where_you_lora_matters,
   title={Where You LoRA Matters: Investigating Adapter Placement and Modality Collapse in Vision-Language Models},
