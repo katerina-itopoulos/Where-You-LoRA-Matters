@@ -12,65 +12,53 @@ sys.path.insert(0, str(project_root))
 import torch
 import gcsfs
 from datasets import load_dataset, Dataset
-from transformers import AutoProcessor
+from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 from peft import PeftModel
-from qwen_vl_utils import process_vision_info
-from tqdm import tqdm
 import json
 import numpy as np
 import gc
 import shutil
-from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+import pandas as pd
 from src.experiments import run_pipeline_answers
 
-# ================================
-# CONFIG
-# ================================
 
 class EvalConfig:
-    """Configuration for evaluation"""
+    """Evaluation configuration for all benchmarks."""
     MODEL_NAME = "Qwen/Qwen3-VL-8B-Instruct"
     GCS_BUCKET = "where_you_lora_matters_thesis"
     BATCH_SIZE = 1
     
-    # Image resolution - same as training
-    MIN_PIXELS = 196 * 32 * 32  # ~448x448 (same as training)
+    MIN_PIXELS = 196 * 32 * 32
     MAX_PIXELS = 196 * 32 * 32
     
-    # LoRA checkpoint (set to None for base model)
     LORA_CHECKPOINT = None
-    IS_BASELINE = True 
+    IS_BASELINE = True
     
-    # Output directory
-    EXPERIMENT_NAME = "baseline"  # Change for each experiment
+    EXPERIMENT_NAME = "baseline"
     OUTPUT_DIR = f"experiments/{EXPERIMENT_NAME}"
     
-    # VQAv2 split configuration (matching your training setup)
     VQAV2_TRAIN_SIZE = 20000
     VQAV2_VAL_SIZE = 2000
-    # Test set = validation split, skipping train+val samples
     
-    # Evaluation settings
     EVAL_VQAV2 = True
     EVAL_DASH_B = True
     EVAL_HALLUSIONBENCH = True
-    EVAL_VQA_VS = True  # Set to True once VQA-VS is reprocessed
+    EVAL_MMVP = True
+    EVAL_VQA_VS = True
     
-    # Sampling for quick tests (set to None for full eval)
-    VQAV2_TEST_SAMPLE_SIZE = 100  # None for full test set (192,354 samples after skipping train+val)
-    DASH_B_SAMPLE_SIZE = 100   # Already small dataset
-    HALLUSION_SAMPLE_SIZE = 100  # Already small dataset
-    VQA_VS_SAMPLE_SIZE = 100
+    VQAV2_TEST_SAMPLE_SIZE = 2000
+    DASH_B_SAMPLE_SIZE = None
+    HALLUSION_SAMPLE_SIZE = None
+    MMVP_SAMPLE_SIZE = None
+    VQA_VS_SAMPLE_SIZE = 2000
+
 
 config = EvalConfig()
 fs = gcsfs.GCSFileSystem(token='google_default')
 
-# ================================
-# LOAD MODEL + LORA
-# ================================
 
 def load_model_and_processor(config, lora_checkpoint=None):
-    """Load base model + LoRA adapter"""
+    """Load base model and optional LoRA adapter."""
     print("\n" + "="*80)
     print("LOADING MODEL")
     print("="*80)
@@ -82,8 +70,7 @@ def load_model_and_processor(config, lora_checkpoint=None):
         min_pixels=config.MIN_PIXELS,
         max_pixels=config.MAX_PIXELS,
     )
-    print("✓ Processor loaded")
-    print(f"  Image resolution: ~448x448 (min/max pixels: {config.MIN_PIXELS:,})")
+    print(f"Processor loaded (resolution: ~448x448, {config.MIN_PIXELS:,} pixels)")
     
     print("\n[2/3] Loading base model...")
     model = Qwen3VLForConditionalGeneration.from_pretrained(
@@ -93,14 +80,9 @@ def load_model_and_processor(config, lora_checkpoint=None):
         trust_remote_code=True
     )
     
-    # Disable gradient checkpointing for inference
     if hasattr(model, 'gradient_checkpointing_disable'):
         model.gradient_checkpointing_disable()
-        print("✓ Gradient checkpointing disabled")
     
-    print("✓ Base model loaded")
-    
-    # Load LoRA if checkpoint provided
     if lora_checkpoint:
         print(f"\n[3/3] Loading LoRA adapter from GCS...")
         local_adapter_path = "/tmp/lora_adapter"
@@ -109,12 +91,7 @@ def load_model_and_processor(config, lora_checkpoint=None):
             shutil.rmtree(local_adapter_path)
         os.makedirs(local_adapter_path)
         
-        # Handle both directory and file paths
-        if lora_checkpoint.endswith('.safetensors'):
-            adapter_dir = lora_checkpoint.rsplit('/', 1)[0]
-        else:
-            adapter_dir = lora_checkpoint
-        
+        adapter_dir = lora_checkpoint.rsplit('/', 1)[0] if lora_checkpoint.endswith('.safetensors') else lora_checkpoint
         adapter_dir = adapter_dir if adapter_dir.startswith('gs://') else 'gs://' + adapter_dir
         adapter_dir_clean = adapter_dir.replace('gs://', '')
         
@@ -127,44 +104,27 @@ def load_model_and_processor(config, lora_checkpoint=None):
             local_file = os.path.join(local_adapter_path, filename)
             fs.get(file, local_file)
         
-        print("Loading LoRA weights...")
         model = PeftModel.from_pretrained(model, local_adapter_path)
-        
-        # Merge LoRA weights into base model for faster inference
-        print("Merging LoRA weights into base model...")
         model = model.merge_and_unload()
-        
-        print("✓ LoRA adapter loaded and merged")
+        print("LoRA adapter loaded and merged")
     else:
-        print("\n[3/3] No LoRA checkpoint - using base model")
+        print("\n[3/3] Using base model (no LoRA)")
     
     model.eval()
-    
-    # Warmup to optimize CUDA kernels
-    print("\nWarming up model...")
-    device = next(model.parameters()).device
     torch.cuda.empty_cache()
     
-    print(f"✓ Model ready on {device}")
+    device = next(model.parameters()).device
+    print(f"Model ready on {device}")
     
     return model, processor
+
 
 print("Loading model and processor...")
 model, processor = load_model_and_processor(config, config.LORA_CHECKPOINT)
 
-# --------------------------------
-# Dataset-specific formatting
-# --------------------------------
 
 def format_dataset_for_pipeline(dataset, dataset_type):
-    """
-    Convert HF dataset to format expected by your pipeline
-    Your run_batch_block_vectors expects rows with:
-    - 'image': PIL Image
-    - 'question': str
-    - 'answers': list of answer dicts (VQAv2/VQA-VS format)
-    - OR 'multiple_choice_answer': single answer string
-    """
+    """Convert HF dataset to pipeline format."""
     formatted_rows = []
     
     for example in dataset:
@@ -173,31 +133,21 @@ def format_dataset_for_pipeline(dataset, dataset_type):
             'question': example['question'],
         }
         
-        # Add answer based on dataset structure
         if dataset_type == "vqav2":
-            # VQAv2 has 'answers' field with list of dicts
             row['answers'] = example.get('answers', [])
-        
         elif dataset_type == "dash_b":
-            # DASH-B has single 'answer' field (yes/no)
             row['multiple_choice_answer'] = example.get('answer', '')
-        
         elif dataset_type == "hallusionbench":
-            # HallusionBench has 'gt_answer' or 'answer' field
             answer = example.get('gt_answer', example.get('answer', ''))
-            # Normalize to yes/no for consistency
             if str(answer) in ['1', 'true', 'True']:
                 row['multiple_choice_answer'] = 'yes'
             elif str(answer) in ['0', 'false', 'False']:
                 row['multiple_choice_answer'] = 'no'
             else:
                 row['multiple_choice_answer'] = str(answer)
-        
         elif dataset_type == "vqa_vs":
-            # VQA-VS has same format as VQAv2 (now that we reprocessed it)
             row['answers'] = example.get('answers', [])
         
-        # Keep metadata
         if 'question_id' in example:
             row['question_id'] = example['question_id']
         if 'image_id' in example:
@@ -207,68 +157,57 @@ def format_dataset_for_pipeline(dataset, dataset_type):
     
     return formatted_rows
 
+
 def add_prompt_suffix(rows, dataset_type, is_baseline=False):
-    """Add dataset-specific prompt suffixes"""
+    """Add dataset-specific prompt suffixes."""
     if dataset_type == "dash_b":
         for row in rows:
             row['question'] = f"{row['question']} Answer with yes or no only."
     elif dataset_type == "hallusionbench":
         for row in rows:
             row['question'] = f"{row['question']} Answer with yes or no only."
-    elif dataset_type in ["vqav2", "vqa_vs"] and is_baseline:  # Only for baseline
+    elif dataset_type in ["vqav2", "vqa_vs"] and is_baseline:
         for row in rows:
             row['question'] = f"{row['question']} Provide a short answer (one or a few words)."
     return rows
 
+
 def parse_answer(answer, dataset_type):
-    """Parse model output based on dataset type"""
+    """Parse model output based on dataset type."""
     answer_lower = answer.lower().strip()
     
     if dataset_type in ["dash_b", "hallusionbench"]:
-        # Both use yes/no format
         if "yes" in answer_lower or "1" in answer_lower or "true" in answer_lower:
             return "yes"
         elif "no" in answer_lower or "0" in answer_lower or "false" in answer_lower:
             return "no"
         return answer_lower
-    
-    else:  # vqav2, vqa-vs
+    else:
         return answer.strip()
 
-# --------------------------------
-# Evaluation metrics
-# --------------------------------
 
 def compute_vqa_accuracy(predictions, references):
-    """
-    VQA-style accuracy (for VQAv2 and VQA-VS)
-    Reference format: list of answer dicts [{"answer": "yes", ...}, ...]
-    Formula: Acc(ans) = min(# humans that said ans / 3, 1)
-    """
+    """VQA-style soft accuracy: Acc(ans) = min(#humans/3, 1)."""
     correct = 0
     total = len(predictions)
     
     for pred, ref in zip(predictions, references):
         pred_clean = pred.lower().strip()
         
-        # Count how many annotators gave each answer
         answer_counts = {}
         for ans_dict in ref:
             ans = ans_dict['answer'].lower().strip()
             answer_counts[ans] = answer_counts.get(ans, 0) + 1
         
-        # VQA accuracy: min(# humans that said answer / 3, 1)
         pred_count = answer_counts.get(pred_clean, 0)
         accuracy = min(pred_count / 3.0, 1.0)
         correct += accuracy
     
     return {"accuracy": correct / total if total > 0 else 0.0}
 
+
 def compute_binary_classification_metrics(predictions, references, dataset_name=""):
-    """
-    Binary classification metrics for DASH-B and HallusionBench
-    Computes: Accuracy, Precision, Recall, F1, Yes rate
-    """
+    """Binary classification metrics: accuracy, precision, recall, F1."""
     tp = fp = tn = fn = 0
     
     for pred, ref in zip(predictions, references):
@@ -303,40 +242,24 @@ def compute_binary_classification_metrics(predictions, references, dataset_name=
         'fn': fn,
     }
 
-# --------------------------------
-# Unified evaluation + feature extraction
-# --------------------------------
 
 def evaluate_and_extract_features(dataset, dataset_name, dataset_type, metric_fn, output_dir, max_samples=None):
-    """
-    Unified pipeline: extract features AND generate answers in one pass
-    Uses your run_pipeline_100 function
-    """
-    
+    """Run inference, extract features, and compute metrics."""
     print(f"\n{'='*70}")
     print(f"Processing {dataset_name}")
     print(f"{'='*70}")
     
-    # Convert dataset to format expected by your pipeline
     print("Formatting dataset...")
     rows = format_dataset_for_pipeline(dataset, dataset_type)
-    
-    # Add dataset-specific prompts
     rows = add_prompt_suffix(rows, dataset_type, is_baseline=config.IS_BASELINE)
     
-    # Limit samples if specified
     if max_samples:
         rows = rows[:max_samples]
         print(f"Sampling {max_samples} examples")
     
-    # Convert to HF Dataset (required by your run_batch_block_vectors)
     ds = Dataset.from_list(rows)
     
-    print(f"Running unified pipeline on {len(ds)} samples...")
-    print("  - Extracting Vproj and T_fused vectors")
-    print("  - Generating answers")
-    
-    # Use your run_pipeline_100 which does BOTH feature extraction and generation
+    print(f"Running pipeline on {len(ds)} samples...")
     V0_all, Vproj_all, T_all, answers = run_pipeline_answers(
         model,
         processor,
@@ -350,13 +273,11 @@ def evaluate_and_extract_features(dataset, dataset_name, dataset_type, metric_fn
         max_new_tokens=16,
     )
     
-    print(f"✓ Extracted features: Vproj {Vproj_all.shape}, T_fused {T_all.shape}")
-    print(f"✓ Generated {len(answers)} answers")
+    print(f"Extracted features: Vproj {Vproj_all.shape}, T_fused {T_all.shape}")
+    print(f"Generated {len(answers)} answers")
     
-    # Parse answers based on dataset type
     predictions = [parse_answer(ans, dataset_type) for ans in answers]
     
-    # Get references
     references = []
     for row in rows:
         if 'answers' in row:
@@ -364,22 +285,17 @@ def evaluate_and_extract_features(dataset, dataset_name, dataset_type, metric_fn
         else:
             references.append(row['multiple_choice_answer'])
     
-    # Compute metrics
-    print(f"\nComputing metrics...")
     metrics = metric_fn(predictions, references)
     
-    print(f"\n📊 Results for {dataset_name}:")
+    print(f"\nResults for {dataset_name}:")
     for k, v in metrics.items():
         if isinstance(v, float):
             print(f"  {k}: {v:.4f}")
         else:
             print(f"  {k}: {v}")
     
-    # Save features to GCS
     features_path = f"{output_dir}/features/{dataset_name}_features.npz"
     gcs_features_path = f"gs://{config.GCS_BUCKET}/{features_path}"
-    
-    print(f"\nSaving features to {gcs_features_path}...")
     local_features_path = "/tmp/temp_features.npz"
     
     np.savez_compressed(
@@ -392,11 +308,8 @@ def evaluate_and_extract_features(dataset, dataset_name, dataset_type, metric_fn
     with open(local_features_path, 'rb') as f:
         with fs.open(gcs_features_path, 'wb') as gcs_f:
             gcs_f.write(f.read())
-    
     os.remove(local_features_path)
-    print(f"✓ Features saved")
     
-    # Save predictions and metrics
     results = {
         'dataset': dataset_name,
         'dataset_type': dataset_type,
@@ -417,8 +330,6 @@ def evaluate_and_extract_features(dataset, dataset_name, dataset_type, metric_fn
     
     results_path = f"{output_dir}/results/{dataset_name}_results.json"
     gcs_results_path = f"gs://{config.GCS_BUCKET}/{results_path}"
-    
-    print(f"Saving results to {gcs_results_path}...")
     local_results_path = "/tmp/temp_results.json"
 
     with open(local_results_path, 'w') as f:
@@ -427,42 +338,28 @@ def evaluate_and_extract_features(dataset, dataset_name, dataset_type, metric_fn
     with open(local_results_path, 'rb') as f:
         with fs.open(gcs_results_path, 'wb') as gcs_f:
             gcs_f.write(f.read())
-    
     os.remove(local_results_path)
-    print(f"✓ Results saved")
     
-    # Cleanup
     del ds, V0_all, Vproj_all, T_all, answers, predictions, references
     gc.collect()
     torch.cuda.empty_cache()
     
     return metrics
 
-# --------------------------------
-# Main evaluation
-# --------------------------------
 
 print("="*80)
 print(f"EVALUATION: {config.EXPERIMENT_NAME}")
 print("="*80)
 print(f"LoRA checkpoint: {config.LORA_CHECKPOINT or 'None (base model)'}")
 print(f"Output directory: gs://{config.GCS_BUCKET}/{config.OUTPUT_DIR}/")
-print(f"\nDatasets to evaluate:")
-print(f"  VQAv2: {config.EVAL_VQAV2}")
-print(f"  DASH-B: {config.EVAL_DASH_B}")
-print(f"  HallusionBench: {config.EVAL_HALLUSIONBENCH}")
-print(f"  VQA-VS OOD: {config.EVAL_VQA_VS}")
 
 all_results = {}
 
-# ================================
-# 1. VQAv2 Test (validation split, skipping train+val)
-# ================================
+
 if config.EVAL_VQAV2:
     print("\n" + "="*80)
-    print("1️⃣ VQAv2 Test Set")
+    print("VQAv2 Test Set")
     print("="*80)
-    print(f"Using validation split, skipping first {config.VQAV2_TRAIN_SIZE + config.VQAV2_VAL_SIZE} samples")
     
     vqav2_stream = load_dataset(
         "lmms-lab/VQAv2", 
@@ -471,18 +368,13 @@ if config.EVAL_VQAV2:
         cache_dir="/tmp/hf_datasets_cache"
     )
     
-    # Skip train and val samples to get test set
     vqav2_test_stream = vqav2_stream.skip(config.VQAV2_TRAIN_SIZE + config.VQAV2_VAL_SIZE)
     
-    # Convert streaming to list (with optional sampling)
     if config.VQAV2_TEST_SAMPLE_SIZE:
-        print(f"Sampling {config.VQAV2_TEST_SAMPLE_SIZE} test samples...")
         vqav2_list = list(vqav2_test_stream.take(config.VQAV2_TEST_SAMPLE_SIZE))
     else:
-        print("Loading full VQAv2 test set (192,354 samples - this may take a while)...")
         vqav2_list = list(vqav2_test_stream)
     
-    print(f"Loaded {len(vqav2_list)} test samples")
     vqav2_ds = Dataset.from_list(vqav2_list)
     
     all_results['vqav2_test'] = evaluate_and_extract_features(
@@ -497,20 +389,14 @@ if config.EVAL_VQAV2:
     gc.collect()
     torch.cuda.empty_cache()
 
-# ================================
-# 2. DASH-B
-# ================================
+
 if config.EVAL_DASH_B:
     print("\n" + "="*80)
     print("DASH-B Dataset")
     print("="*80)
     
     try:
-        dashb_data = load_dataset(
-            "YanNeu/DASH-B",  # Adjust if different
-            split="test", 
-            cache_dir="/tmp/hf_datasets_cache"
-        )
+        dashb_data = load_dataset("YanNeu/DASH-B", split="test", cache_dir="/tmp/hf_datasets_cache")
         
         all_results['dash_b'] = evaluate_and_extract_features(
             dashb_data,
@@ -526,28 +412,17 @@ if config.EVAL_DASH_B:
         torch.cuda.empty_cache()
         
     except Exception as e:
-        print(f" Error loading DASH-B: {e}")
-        print("Please verify the correct HuggingFace dataset path for DASH-B")
-        print("You may need to download it manually or check the dataset name")
+        print(f"Error loading DASH-B: {e}")
 
-# ================================
-# 3. HallusionBench
-# ================================
+
 if config.EVAL_HALLUSIONBENCH:
     print("\n" + "="*80)
-    print("3️⃣ HallusionBench")
+    print("HallusionBench")
     print("="*80)
     
-    # Process both splits
-    for split_name in ["image", "non_image"]:
-        print(f"\n  Processing HallusionBench {split_name} split...")
-        
+    for split_name in ["image"]:
         try:
-            hallusion_data = load_dataset(
-                "lmms-lab/HallusionBench", 
-                split=split_name,  # Use 'image' or 'non_image'
-                cache_dir=None
-            )
+            hallusion_data = load_dataset("lmms-lab/HallusionBench", split=split_name, cache_dir=None)
             
             all_results[f'hallusionbench_{split_name}'] = evaluate_and_extract_features(
                 hallusion_data,
@@ -563,33 +438,144 @@ if config.EVAL_HALLUSIONBENCH:
             torch.cuda.empty_cache()
             
         except Exception as e:
-            print(f"⚠️ Error loading HallusionBench {split_name}: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"Error loading HallusionBench {split_name}: {e}")
 
-# ================================
-# 4. VQA-VS OOD sets
-# ================================
-# In the VQA-VS evaluation section (around line 490), update:
+
+if config.EVAL_MMVP:
+    print("\n" + "="*80)
+    print("MMVP (Multi-Modal Visual Patterns)")
+    print("="*80)
+    
+    try:
+        img_ds = load_dataset("MMVP/MMVP", split="train", cache_dir="/tmp/hf_datasets_cache")
+        
+        photo_id_to_img = {}
+        for i in range(len(img_ds)):
+            img = img_ds[i]["image"]
+            fname = os.path.basename(img.filename)
+            photo_id = int(fname.replace(".jpg", ""))
+            photo_id_to_img[photo_id] = img
+        
+        csv_path = f"gs://{config.GCS_BUCKET}/datasets/mmvp/Questions.csv"
+        df = pd.read_csv(csv_path)
+        
+        rows = []
+        for i in range(len(df)):
+            photo_id = i + 1
+            rows.append({
+                "image": photo_id_to_img[photo_id],
+                "question": df.iloc[i]["Question"],
+                "options": df.iloc[i]["Options"],
+                "correct_answer": str(df.iloc[i]["Correct Answer"]).strip(),
+            })
+        
+        mmvp_ds = Dataset.from_list(rows)
+        
+        def parse_answer_mmvp(answer):
+            a = (answer or "").lower().strip()
+            if "(a)" in a or a == "a":
+                return "(a)"
+            if "(b)" in a or a == "b":
+                return "(b)"
+            return a
+        
+        def compute_mmvp_accuracy(predictions, references):
+            correct = sum(int(p == r) for p, r in zip(predictions, references))
+            n = len(predictions)
+            return {"accuracy": (correct / n) if n > 0 else 0.0, "num_samples": n}
+        
+        formatted_rows = []
+        for example in mmvp_ds:
+            row = {
+                'image': example['image'],
+                'question': f"{example['question']}\nOptions:\n{example['options']}\nYour answer must be exactly one of: (a) or (b).",
+                'multiple_choice_answer': example['correct_answer']
+            }
+            formatted_rows.append(row)
+        
+        if config.MMVP_SAMPLE_SIZE:
+            formatted_rows = formatted_rows[:config.MMVP_SAMPLE_SIZE]
+        
+        mmvp_ds_formatted = Dataset.from_list(formatted_rows)
+        
+        V0_all, Vproj_all, T_all, answers = run_pipeline_answers(
+            model, processor, mmvp_ds_formatted,
+            batch_size=config.BATCH_SIZE,
+            do_sample=False, temperature=0.0, top_p=1.0, top_k=1,
+            repetition_penalty=1.0, max_new_tokens=16,
+        )
+        
+        predictions = [parse_answer_mmvp(ans) for ans in answers]
+        references = [row['multiple_choice_answer'] for row in formatted_rows]
+        metrics = compute_mmvp_accuracy(predictions, references)
+        
+        print(f"\nMMVP Results:")
+        print(f"  Accuracy: {metrics['accuracy']:.4f}")
+        
+        features_path = f"{config.OUTPUT_DIR}/features/mmvp_features.npz"
+        gcs_features_path = f"gs://{config.GCS_BUCKET}/{features_path}"
+        local_features_path = "/tmp/temp_features.npz"
+        
+        np.savez_compressed(
+            local_features_path,
+            Vproj=Vproj_all.float().cpu().numpy(),
+            T_fused=T_all.float().cpu().numpy(),
+            V0=V0_all.float().cpu().numpy() if V0_all is not None else None,
+        )
+        
+        with open(local_features_path, 'rb') as f:
+            with fs.open(gcs_features_path, 'wb') as gcs_f:
+                gcs_f.write(f.read())
+        os.remove(local_features_path)
+        
+        results = {
+            'dataset': 'mmvp',
+            'dataset_type': 'mmvp',
+            'metrics': metrics,
+            'num_samples': len(predictions),
+            'lora_checkpoint': config.LORA_CHECKPOINT,
+            'experiment_name': config.EXPERIMENT_NAME,
+            'predictions': [
+                {'question': row['question'], 'prediction': pred, 'reference': ref}
+                for row, pred, ref in zip(formatted_rows, predictions, references)
+            ]
+        }
+        
+        results_path = f"{config.OUTPUT_DIR}/results/mmvp_results.json"
+        gcs_results_path = f"gs://{config.GCS_BUCKET}/{results_path}"
+        local_results_path = "/tmp/temp_results.json"
+        
+        with open(local_results_path, 'w') as f:
+            json.dump(results, f, indent=2)
+        with open(local_results_path, 'rb') as f:
+            with fs.open(gcs_results_path, 'wb') as gcs_f:
+                gcs_f.write(f.read())
+        os.remove(local_results_path)
+        
+        all_results['mmvp'] = metrics
+        
+        del img_ds, mmvp_ds, mmvp_ds_formatted, V0_all, Vproj_all, T_all, answers
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+    except Exception as e:
+        print(f"Error loading MMVP: {e}")
+
 
 if config.EVAL_VQA_VS:
     print("\n" + "="*80)
-    print("4️⃣ VQA-VS OOD Sets")
+    print("VQA-VS OOD Sets")
     print("="*80)
     
     OOD_CATEGORIES = ['ko', 'kop', 'kw_ko', 'kw', 'kwp', 'qt_ko', 'qt_kw_ko', 'qt_kw', 'qt']
     
     for category in OOD_CATEGORIES:
-        print(f"\n  Processing OOD {category}...")
-        
         ood_path = f"gs://{config.GCS_BUCKET}/datasets/vqa-vs-preprocessed/ood_{category}/*.parquet"
         
         try:
             ood_data = load_dataset("parquet", data_files=ood_path, split="train")
             
-            # Sample if specified
-            if hasattr(config, 'VQA_VS_SAMPLE_SIZE') and config.VQA_VS_SAMPLE_SIZE:
-                print(f"  Sampling {config.VQA_VS_SAMPLE_SIZE} from {len(ood_data)} samples")
+            if config.VQA_VS_SAMPLE_SIZE:
                 import random
                 indices = random.sample(range(len(ood_data)), min(config.VQA_VS_SAMPLE_SIZE, len(ood_data)))
                 ood_data = ood_data.select(indices)
@@ -607,15 +593,11 @@ if config.EVAL_VQA_VS:
             torch.cuda.empty_cache()
             
         except Exception as e:
-            print(f"⚠️ Error loading {category}: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"Error loading {category}: {e}")
 
-# ================================
-# Save summary
-# ================================
+
 print("\n" + "="*80)
-print("ALL PROCESSING COMPLETE!")
+print("EVALUATION COMPLETE")
 print("="*80)
 
 summary = {
@@ -642,9 +624,9 @@ with open("/tmp/summary.json", 'rb') as f:
         gcs_f.write(f.read())
 
 os.remove("/tmp/summary.json")
-print(f"\nSummary saved to {gcs_summary_path}")
 
-print("\nSummary of all results:")
+print(f"\nSummary saved to {gcs_summary_path}")
+print("\nResults summary:")
 for dataset, metrics in all_results.items():
     print(f"\n{dataset}:")
     for k, v in metrics.items():
@@ -653,9 +635,7 @@ for dataset, metrics in all_results.items():
         else:
             print(f"  {k}: {v}")
 
-print("\n All outputs saved to:")
+print(f"\nOutputs saved to:")
 print(f"  Features: gs://{config.GCS_BUCKET}/{config.OUTPUT_DIR}/features/")
 print(f"  Results:  gs://{config.GCS_BUCKET}/{config.OUTPUT_DIR}/results/")
 print(f"  Summary:  {gcs_summary_path}")
-
-

@@ -2,114 +2,137 @@ import numpy as np
 import torch
 import wandb
 from peft import PeftModel
-from transformers import AutoModelForCausalLM, TrainerCallback
+from transformers import AutoModelForCausalLM, TrainerCallback, TrainerControl, TrainerState, TrainingArguments
+from wandb.sdk.wandb_run import Run
+from wandb.sdk.artifacts.artifact import Artifact
 
-def initialize_wandb(project_name, run_name, entity, config_dict):
-    """Initialize W&B run"""
+
+def initialize_wandb(
+    project_name: str,
+    run_name: str,
+    entity: str,
+    config_dict: dict,
+) -> Run:
+    """Initialize a W&B run and return the run object."""
     print(f"\n{'='*70}")
-    print("🚀 Initializing Weights & Biases")
+    print("Initializing Weights & Biases")
     print(f"{'='*70}")
 
-    wandb.init(
+    run = wandb.init(
         project=project_name,
         name=run_name,
         entity=entity,
-        config=config_dict
+        config=config_dict,
     )
 
-    print(f"✓ W&B Run: {wandb.run.name}")
-    print(f"✓ URL: {wandb.run.url}")
+    print(f"W&B Run: {wandb.run.name}")
+    print(f"URL: {wandb.run.url}")
+
+    return run
+
 
 class WandBLoRAMetricsCallback(TrainerCallback):
-    """Logs LoRA-specific metrics to W&B"""
+    """Trainer callback that logs LoRA-specific metrics to W&B."""
 
-    def __init__(self, compute_freq=5):
+    def __init__(self, compute_freq: int = 5) -> None:
         self.compute_freq = compute_freq
-        self.best_val_loss = float('inf')
+        self.best_val_loss: float = float("inf")
 
-    def on_log(self, args, state, control, model, logs=None, **kwargs):
-        """Log metrics to W&B at each logging step"""
+    def on_log(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        model: torch.nn.Module,
+        logs: dict | None = None,
+        **kwargs,
+    ) -> None:
+        """Log LoRA metrics to W&B at each logging step."""
         if logs is None:
             return
 
-        # Calculate current epoch
-        current_epoch = state.epoch if state.epoch is not None else 0
+        current_epoch: float = state.epoch if state.epoch is not None else 0.0
 
-        # Compute LoRA metrics periodically
         if state.global_step % self.compute_freq == 0:
             lora_metrics = self.compute_lora_metrics(model)
-            # Add epoch to metrics for x-axis
-            lora_metrics['epoch'] = current_epoch
+            lora_metrics["epoch"] = current_epoch
             wandb.log(lora_metrics)
             self._print_lora_metrics(lora_metrics, current_epoch)
 
-        # Track best model
-        if 'eval_loss' in logs:
-            if logs['eval_loss'] < self.best_val_loss:
-                self.best_val_loss = logs['eval_loss']
-                wandb.run.summary["best_val_loss"] = self.best_val_loss
-                wandb.run.summary["best_epoch"] = current_epoch
+        if "eval_loss" in logs and logs["eval_loss"] < self.best_val_loss:
+            self.best_val_loss = logs["eval_loss"]
+            wandb.run.summary["best_val_loss"] = self.best_val_loss
+            wandb.run.summary["best_epoch"] = current_epoch
 
-    def compute_lora_metrics(self, model):
-        """Compute LoRA-specific metrics"""
-        all_eranks = []
-        all_stable_ranks = []
-        all_frobenius_norms = []
-        all_spectral_norms = []
+    def compute_lora_metrics(self, model: torch.nn.Module) -> dict[str, float]:
+        """Compute effective rank, stable rank, and norm stats across all LoRA layers."""
+        all_eranks: list[float] = []
+        all_stable_ranks: list[float] = []
+        all_frobenius_norms: list[float] = []
 
-        for name, module in model.named_modules():
-            if hasattr(module, 'lora_A') and hasattr(module, 'lora_B'):
-                with torch.no_grad():
-                    lora_A = module.lora_A['default'].weight.float()
-                    lora_B = module.lora_B['default'].weight.float()
-                    lora_weight = lora_B @ lora_A
+        nominal_rank: int = 0
 
-                    # Compute singular values
-                    s = torch.linalg.svdvals(lora_weight)
+        for _, module in model.named_modules():
+            if not (hasattr(module, "lora_A") and hasattr(module, "lora_B")):
+                continue
 
-                    # Effective Rank
-                    s_normalized = s / (s.sum() + 1e-10)
-                    entropy = -(s_normalized * torch.log(s_normalized + 1e-10)).sum()
-                    erank = torch.exp(entropy).item()
+            with torch.no_grad():
+                lora_A: torch.Tensor = module.lora_A["default"].weight.float()
+                lora_B: torch.Tensor = module.lora_B["default"].weight.float()
+                lora_weight: torch.Tensor = lora_B @ lora_A
 
-                    # Stable Rank
-                    frobenius_norm = torch.norm(lora_weight, p='fro').item()
-                    spectral_norm = s[0].item()
-                    stable_rank = (frobenius_norm ** 2) / (spectral_norm ** 2 + 1e-10)
+                s: torch.Tensor = torch.linalg.svdvals(lora_weight)
 
-                    all_eranks.append(erank)
-                    all_stable_ranks.append(stable_rank)
-                    all_frobenius_norms.append(frobenius_norm)
-                    all_spectral_norms.append(spectral_norm)
+                s_norm = s / (s.sum() + 1e-10)
+                entropy = -(s_norm * torch.log(s_norm + 1e-10)).sum()
+                erank: float = torch.exp(entropy).item()
 
-        metrics = {}
-        if all_eranks:
-            metrics['lora/effective_rank_mean'] = np.mean(all_eranks)
-            metrics['lora/effective_rank_std'] = np.std(all_eranks)
-            metrics['lora/stable_rank_mean'] = np.mean(all_stable_ranks)
-            metrics['lora/frobenius_norm_mean'] = np.mean(all_frobenius_norms)
+                frob: float = torch.norm(lora_weight, p="fro").item()
+                spectral: float = s[0].item()
+                stable_rank: float = (frob**2) / (spectral**2 + 1e-10)
 
-            # Rank utilization
-            nominal_rank = lora_A.shape[0]
-            metrics['lora/rank_utilization'] = np.mean(all_eranks) / nominal_rank
+                all_eranks.append(erank)
+                all_stable_ranks.append(stable_rank)
+                all_frobenius_norms.append(frob)
+                nominal_rank = lora_A.shape[0]
 
-        return metrics
+        if not all_eranks:
+            return {}
 
-    def _print_lora_metrics(self, metrics, epoch):
-        """Print LoRA metrics summary"""
+        mean_erank = float(np.mean(all_eranks))
+        return {
+            "lora/effective_rank_mean": mean_erank,
+            "lora/effective_rank_std": float(np.std(all_eranks)),
+            "lora/stable_rank_mean": float(np.mean(all_stable_ranks)),
+            "lora/frobenius_norm_mean": float(np.mean(all_frobenius_norms)),
+            "lora/rank_utilization": mean_erank / nominal_rank if nominal_rank else 0.0,
+        }
+
+    def _print_lora_metrics(self, metrics: dict[str, float], epoch: float) -> None:
+        """Print a brief LoRA metrics summary to stdout."""
         print(f"\n{'='*70}")
         print(f"LoRA Metrics at Epoch {epoch:.2f}")
         print(f"{'='*70}")
-        print(f"Effective Rank: {metrics.get('lora/effective_rank_mean', 0):.2f} ± {metrics.get('lora/effective_rank_std', 0):.2f}")
-        print(f"Rank Utilization: {metrics.get('lora/rank_utilization', 0)*100:.1f}%")
+        print(
+            f"Effective Rank: {metrics.get('lora/effective_rank_mean', 0):.2f}"
+            f" ± {metrics.get('lora/effective_rank_std', 0):.2f}"
+        )
+        print(f"Rank Utilization: {metrics.get('lora/rank_utilization', 0) * 100:.1f}%")
         print(f"{'='*70}\n")
 
+
 def upload_to_wandb_artifacts(
-    output_dir, run_name, lora_r, lora_alpha,
-    model_name, best_val_loss, train_size, val_size
-):
-    """Upload LoRA checkpoint to W&B Artifacts"""
-    print("\n📦 Uploading LoRA checkpoint to W&B Artifacts...")
+    output_dir: str,
+    run_name: str,
+    lora_r: int,
+    lora_alpha: float,
+    model_name: str,
+    best_val_loss: float,
+    train_size: int,
+    val_size: int,
+) -> Artifact:
+    """Upload a LoRA checkpoint directory to W&B Artifacts and return the artifact."""
+    print("\nUploading LoRA checkpoint to W&B Artifacts...")
 
     artifact = wandb.Artifact(
         name=f"lora-checkpoint-{run_name}",
@@ -122,73 +145,69 @@ def upload_to_wandb_artifacts(
             "best_val_loss": best_val_loss,
             "train_size": train_size,
             "val_size": val_size,
-        }
+        },
     )
 
     artifact.add_dir(output_dir)
     wandb.log_artifact(artifact)
 
-    print(f"✓ LoRA checkpoint uploaded to W&B!")
+    print("LoRA checkpoint uploaded to W&B.")
     return artifact
 
+
 def download_lora_from_wandb(
-    artifact_name,
-    base_model_name,
-    wandb_entity=None,
-    merge=False ):
+    artifact_name: str,
+    wandb_entity: str | None = None,
+) -> str:
     """
-    Load a LoRA checkpoint from W&B Artifacts
+    Download a LoRA artifact from W&B and return the local directory path.
 
     Args:
-        artifact_name: Name of the artifact (e.g., "lora-checkpoint-quick-test-r4:latest")
-        base_model_name: Base model to load
-        wandb_entity: Your W&B username/team
-        merge: If True, merge LoRA into base model for faster inference
-
-    Returns:
-        model: The model with LoRA adapter loaded (or merged)
+        artifact_name: Artifact name, e.g. ``"lora-checkpoint-run:latest"``.
+        wandb_entity: W&B username or team name. Prepended to the artifact path when provided.
     """
     api = wandb.Api()
-
-    if wandb_entity:
-        artifact_path = f"{wandb_entity}/{artifact_name}"
-    else:
-        artifact_path = artifact_name
-
+    artifact_path = f"{wandb_entity}/{artifact_name}" if wandb_entity else artifact_name
     artifact = api.artifact(artifact_path)
-    artifact_dir = artifact.download()
+    artifact_dir: str = artifact.download()
 
-    print(f"✓ Downloaded to: {artifact_dir}")
+    print(f"Downloaded to: {artifact_dir}")
+    return artifact_dir
 
 
-def load_lora(base_model_name, artifact_dir, merge):
+def load_lora(
+    base_model_name: str,
+    artifact_dir: str,
+    merge: bool = False,
+) -> torch.nn.Module:
+    """
+    Load a base model and attach (or merge) a LoRA adapter from a local directory.
 
-  """Load base model"""
-  print(f"\n Loading base model: {base_model_name}")
-
-  base_model = AutoModelForCausalLM.from_pretrained(
+    Args:
+        base_model_name: HuggingFace model ID for the base model.
+        artifact_dir: Local path containing the LoRA adapter weights.
+        merge: When ``True``, merges the adapter into the base model weights
+               and unloads it for faster inference.
+    """
+    print(f"\nLoading base model: {base_model_name}")
+    base_model = AutoModelForCausalLM.from_pretrained(
         base_model_name,
         torch_dtype=torch.bfloat16,
         device_map="auto",
-        trust_remote_code=True
+        trust_remote_code=True,
     )
 
-  # Load LoRA adapter
-  print(f"\n🔧 Loading LoRA adapter...")
-  model = PeftModel.from_pretrained(base_model, artifact_dir)
+    print("\nLoading LoRA adapter...")
+    model: torch.nn.Module = PeftModel.from_pretrained(base_model, artifact_dir)
+    print("LoRA adapter loaded!")
 
-  print(f"✓ LoRA adapter loaded!")
-  print(f"  Metadata: {artifact.metadata}")
+    if merge:
+        print("\nMerging LoRA into base model...")
+        model = model.merge_and_unload()
+        print("Merged. Model is now standalone.")
 
-  # Optionally merge
-  if merge:
-      print(f"\n🔀 Merging LoRA into base model...")
-      model = model.merge_and_unload()
-      print(f"✓ Merged! Model is now standalone.")
+    print(f"\n{'='*70}")
+    print("Model ready for inference!")
+    print(f"{'='*70}\n")
 
-  print(f"\n{'='*70}")
-  print("✅ Model ready for inference!")
-  print(f"{'='*70}\n")
-
-  return model
-
+    return model
