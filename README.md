@@ -20,7 +20,7 @@ This repository contains the code for fine-tuning and evaluating **Qwen3-VL-8B**
 ### Collapse Metrics
 
 Modality collapse is measured using:
-- **CKA** (Centered Kernel Alignment) — primary indicator of representational similarity pre/post fine-tuning
+- **CKA** (Centered Kernel Alignment) — cross-modal alignment strength between vision and language representations
 - **Normalized Effective Rank** — dimensionality of learned representations
 - **Concentration Ratio (CR)** — variance concentration in top singular values
 - **Intra-modal Similarity** — within-modality representational uniformity
