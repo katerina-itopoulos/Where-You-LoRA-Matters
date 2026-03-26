@@ -159,7 +159,7 @@ python scripts/visualize_results_wandb.py
 If you find this work useful, please cite:
 ```bibtex
 @mastersthesis{where_you_lora_matters,
-  title={Where You LoRA Matters: Investigating Adapter Placement and Modality Collapse in Vision-Language Models},
+  title={Where You LoRA Matters: Investigating Adapter Placement and Modality Collapse in Multimodal Large Language Models},
   author={Katerina Itopoulos},
   year={2026},
   school={SRH-Berlin}
